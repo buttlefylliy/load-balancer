@@ -60,7 +60,11 @@
 * ``HealthCheckTracker(pool, failure_threshold, recovery_threshold)``：
   只消费显式检查结果的健康跟踪器，按连续失败/成功次数在共享池中自动
   摘除与回切后端；不发起网络请求、不读取墙上时钟。单次记录平均 O(1)
-  时间，完整查询 O(n) 时间，空间 O(n)。
+  时间，完整查询 O(n) 时间，空间 O(n)；``explain(backend_id, success,
+  now)`` 返回键序固定为 backend_id、success、checked_at、healthy、
+  changed、consecutive_failures、consecutive_successes、reason 的只读
+  预览，与 record_result 同校验同判定但不修改任何状态，单次 O(1) 时间
+  与 O(1) 额外空间。
 """
 
 import argparse
@@ -1519,6 +1523,7 @@ class HealthCheckTracker:
     后端的连续计数。
 
     单次记录平均 O(1) 时间，statuses 完整查询 O(n) 时间，空间 O(n)。
+    ``explain`` 单次为 O(1) 时间与 O(1) 额外空间。
     """
 
     def __init__(self, pool, failure_threshold, recovery_threshold):
@@ -1556,16 +1561,12 @@ class HealthCheckTracker:
             for backend in pool._backends
         ]
 
-    def record_result(self, backend_id, success, now):
-        """提交一次健康检查结果，返回键序固定的状态副本。
+    def _validate_event(self, backend_id, success, now):
+        """校验一次检查事件，返回后端在声明顺序中的位置。
 
-        结果字典的键序固定为 backend_id、healthy、changed、
-        consecutive_failures、consecutive_successes、checked_at，
-        每次返回与内部状态隔离的新字典。同一后端在同一 now 重复提交
-        相同结果时幂等地返回上次结果的副本；success 冲突、now 回退
-        时抛出 ConnectionStateError。backend_id 非字符串、success
+        校验顺序与 record_result 完全一致：backend_id 非字符串、success
         非布尔或 now 类型错误抛出 TypeError，负 now 抛出 ValueError，
-        未知 id 抛出 KeyError；任何失败都不改变计数、时间或池状态。
+        未知 id 抛出 KeyError，全局时间回退抛出 ConnectionStateError。
         """
         if not isinstance(backend_id, str):
             raise TypeError("backend id must be a string")
@@ -1581,6 +1582,57 @@ class HealthCheckTracker:
             raise KeyError(backend_id)
         if self._now is not None and now < self._now:
             raise ConnectionStateError("now must not move backwards")
+        return index
+
+    def _project(self, state, actual, success):
+        """按记录规则纯计算事件后的计数、健康状态与原因，不修改任何状态。
+
+        以池中实际健康标记 actual 为准：与跟踪器已知状态不一致（外部
+        set_healthy 改写）时先按真实记录规则把连续计数重置为零，再累计
+        本次事件。返回 (consecutive_failures, consecutive_successes,
+        healthy, changed, reason)：actual 为健康且连续失败达到
+        failure_threshold 时摘除并给出 failure_threshold_reached；
+        actual 为不健康且连续成功达到 recovery_threshold 时回切并给出
+        recovery_threshold_reached；其余按 success 给出
+        success_recorded 或 failure_recorded。
+        """
+        failures = state["consecutive_failures"]
+        successes = state["consecutive_successes"]
+        if actual != state["known_healthy"]:
+            failures = 0
+            successes = 0
+        if success:
+            successes += 1
+            failures = 0
+        else:
+            failures += 1
+            successes = 0
+        healthy = actual
+        changed = False
+        if actual and failures >= self._failure_threshold:
+            healthy = False
+            changed = True
+            reason = "failure_threshold_reached"
+        elif not actual and successes >= self._recovery_threshold:
+            healthy = True
+            changed = True
+            reason = "recovery_threshold_reached"
+        else:
+            reason = "success_recorded" if success else "failure_recorded"
+        return failures, successes, healthy, changed, reason
+
+    def record_result(self, backend_id, success, now):
+        """提交一次健康检查结果，返回键序固定的状态副本。
+
+        结果字典的键序固定为 backend_id、healthy、changed、
+        consecutive_failures、consecutive_successes、checked_at，
+        每次返回与内部状态隔离的新字典。同一后端在同一 now 重复提交
+        相同结果时幂等地返回上次结果的副本；success 冲突、now 回退
+        时抛出 ConnectionStateError。backend_id 非字符串、success
+        非布尔或 now 类型错误抛出 TypeError，负 now 抛出 ValueError，
+        未知 id 抛出 KeyError；任何失败都不改变计数、时间或池状态。
+        """
+        index = self._validate_event(backend_id, success, now)
 
         state = self._states[index]
         if state["last_now"] is not None and now == state["last_now"]:
@@ -1592,44 +1644,28 @@ class HealthCheckTracker:
             return dict(state["last_result"])
 
         # 外部 set_healthy 造成的状态偏移在下一次记录时被发现：
-        # 以池中实际状态为准，并重置该后端的连续计数。
+        # 以池中实际状态为准，并重置该后端的连续计数。判定（含阈值
+        # 摘除/回切与原因）与 explain 共用同一纯计算，保持顺序一致。
         actual = self._pool._backends[index]["healthy"]
+        failures, successes, healthy, changed, _reason = self._project(
+            state, actual, success
+        )
         if actual != state["known_healthy"]:
             state["known_healthy"] = actual
-            state["consecutive_failures"] = 0
-            state["consecutive_successes"] = 0
-
-        if success:
-            state["consecutive_successes"] += 1
-            state["consecutive_failures"] = 0
-        else:
-            state["consecutive_failures"] += 1
-            state["consecutive_successes"] = 0
-
-        changed = False
-        if (
-            actual
-            and state["consecutive_failures"] >= self._failure_threshold
-        ):
-            self._pool.set_healthy(backend_id, False)
-            state["known_healthy"] = False
-            changed = True
-        elif (
-            not actual
-            and state["consecutive_successes"] >= self._recovery_threshold
-        ):
-            self._pool.set_healthy(backend_id, True)
-            state["known_healthy"] = True
-            changed = True
+        state["consecutive_failures"] = failures
+        state["consecutive_successes"] = successes
+        if changed:
+            self._pool.set_healthy(backend_id, healthy)
+            state["known_healthy"] = healthy
 
         state["checked_at"] = now
         state["changed"] = changed
         result = {
             "backend_id": backend_id,
-            "healthy": state["known_healthy"],
+            "healthy": healthy,
             "changed": changed,
-            "consecutive_failures": state["consecutive_failures"],
-            "consecutive_successes": state["consecutive_successes"],
+            "consecutive_failures": failures,
+            "consecutive_successes": successes,
             "checked_at": now,
         }
         state["last_now"] = now
@@ -1637,6 +1673,62 @@ class HealthCheckTracker:
         state["last_result"] = result
         self._now = now
         return dict(result)
+
+    def explain(self, backend_id, success, now):
+        """只读预览下一次检查会保持、摘除还是回切后端，不修改任何状态。
+
+        与 record_result 采用完全相同的校验与判定顺序：backend_id 非
+        字符串、success 非布尔或 now 类型错误抛出 TypeError，负 now
+        抛出 ValueError，未知 id 抛出 KeyError，全局时间回退或同一后端
+        同一 now 的冲突结果抛出 ConnectionStateError；任何失败都不改变
+        状态。结果是键序固定为 backend_id、success、checked_at、
+        healthy、changed、consecutive_failures、consecutive_successes、
+        reason 的独立新字典：普通事件的健康状态、变化标记、连续计数与
+        检查时间与当前状态下随后记录同一事件的对应字段逐字段一致，
+        reason 在达到失败/恢复阈值时为 failure_threshold_reached/
+        recovery_threshold_reached，其余为 success_recorded/
+        failure_recorded。外部 set_healthy 改写健康标记后，按池中实际
+        状态重置该后端计数再预测。同一后端在同一 now 重复相同 success
+        时 reason 为 idempotent_repeat，其余字段预测原幂等结果。解释不
+        修改时间、计数、最近结果或池；池状态不变时重复解释逐字段一致，
+        解释后立即记录同一事件也与解释一致；修改返回对象不影响后续
+        行为。单次查询 O(1) 时间与 O(1) 额外空间。
+        """
+        index = self._validate_event(backend_id, success, now)
+
+        state = self._states[index]
+        if state["last_now"] is not None and now == state["last_now"]:
+            if success != state["last_success"]:
+                raise ConnectionStateError(
+                    f"conflicting result for backend {backend_id!r} "
+                    f"at now={now}"
+                )
+            recorded = state["last_result"]
+            return {
+                "backend_id": backend_id,
+                "success": success,
+                "checked_at": recorded["checked_at"],
+                "healthy": recorded["healthy"],
+                "changed": recorded["changed"],
+                "consecutive_failures": recorded["consecutive_failures"],
+                "consecutive_successes": recorded["consecutive_successes"],
+                "reason": "idempotent_repeat",
+            }
+
+        actual = self._pool._backends[index]["healthy"]
+        failures, successes, healthy, changed, reason = self._project(
+            state, actual, success
+        )
+        return {
+            "backend_id": backend_id,
+            "success": success,
+            "checked_at": now,
+            "healthy": healthy,
+            "changed": changed,
+            "consecutive_failures": failures,
+            "consecutive_successes": successes,
+            "reason": reason,
+        }
 
     def statuses(self):
         """按后端声明顺序返回全部后端的状态（新字典组成的新列表）。
