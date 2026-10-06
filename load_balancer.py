@@ -27,6 +27,12 @@
   额外空间 O(1)；``explain(key)`` 返回该次选择键序固定的可重放解释
   （全部候选与分数、selected、outcome、reason），与 select 同校验但
   无健康后端时不抛错，单次查询 O(n) 时间、除返回结果外额外空间 O(1)。
+* ``StickySessionScheduler(pool, max_sessions)``：有界会话绑定调度器，
+  以 OrderedDict 保存至多 max_sessions 个 key→backend_id 绑定并按成功
+  选择维护最近使用顺序：命中（绑定后端仍健康）平均 O(1)，首次选择与
+  故障转移 O(n)（一致性哈希评分），超限时淘汰最久未成功使用的 key；
+  ``bindings()`` 按最久到最近使用顺序返回 O(max_sessions) 的隔离副本，
+  ``explain(key)`` 返回键序固定的可重放解释且不改变状态。
 * ``ConnectionTable(pool, idle_timeout, hard_timeout)``：以五元组标识连接、
   绑定后端池的连接生命周期表。时间只由显式 ``now`` 驱动；按五元组定位、
   记录活动与关闭平均 O(1) 时间，``advance`` 与完整查询 O(n) 时间，
@@ -45,6 +51,7 @@ import hashlib
 import heapq
 import json
 import sys
+from collections import OrderedDict
 
 __all__ = [
     "ConfigurationError",
@@ -56,6 +63,7 @@ __all__ = [
     "WeightedRoundRobinScheduler",
     "LeastConnectionsScheduler",
     "ConsistentHashScheduler",
+    "StickySessionScheduler",
     "ConnectionTable",
     "HealthCheckTracker",
 ]
@@ -559,6 +567,175 @@ class ConsistentHashScheduler:
             "selected": selected,
             "outcome": outcome,
             "reason": reason,
+        }
+
+
+class StickySessionScheduler:
+    """有界会话绑定调度器。
+
+    以 OrderedDict 保存至多 max_sessions 个 key→backend_id 绑定，迭代
+    顺序即成功选择顺序（首项最久未成功使用，末项最近使用）。首次见到
+    的 key 委托现有 ConsistentHashScheduler 按当前健康后端评分并绑定；
+    之后只要绑定后端仍健康就始终返回它（命中 O(1)），健康集合增加或
+    其他后端变化都不迁移。绑定后端不健康时，再次按一致性哈希规则在
+    当前健康后端中重新选择并原子替换绑定，原后端恢复后也不主动迁回。
+
+    每次成功选择都把 key 置为最近使用；新绑定会使绑定数超过
+    max_sessions 时，先淘汰最久未成功使用的 key 再写入，相同事件序列
+    下淘汰顺序确定。没有健康后端时抛出 NoAvailableBackendError，
+    绑定与使用顺序均不改变；任何校验或选择失败都不产生部分修改。
+    """
+
+    def __init__(self, pool, max_sessions):
+        # 先完成 pool 与 max_sessions 的全部校验，再建立任何实例状态；
+        # 校验失败时对象不会被部分构造。
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        # bool 是 int 的子类，上限必须显式排除布尔值。
+        if (
+            isinstance(max_sessions, bool)
+            or not isinstance(max_sessions, int)
+            or max_sessions <= 0
+        ):
+            raise ConfigurationError(
+                "max_sessions must be a positive integer"
+            )
+        self._pool = pool
+        self._max_sessions = max_sessions
+        self._hash = ConsistentHashScheduler(pool)
+        # 首项为最久未成功使用的绑定，末项为最近使用的绑定。
+        self._bindings = OrderedDict()
+
+    def select(self, key):
+        """返回 key 绑定的健康后端，必要时按一致性哈希首次选择或迁移。
+
+        key 校验与 ConsistentHashScheduler.select 完全相同：非字符串
+        抛出 TypeError，空字符串抛出 ValueError，失败不改变状态。
+        绑定后端仍健康时直接命中并把 key 置为最近使用，平均 O(1)；
+        未绑定或绑定后端不健康时按一致性哈希在当前健康后端中选择
+        （O(n)），没有健康后端抛出 NoAvailableBackendError 且绑定与
+        使用顺序都不改变。成功后新绑定超过 max_sessions 时淘汰最久未
+        成功使用的 key。结果是键序固定为 id、address、port 的新字典。
+        """
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        if key == "":
+            raise ValueError("key must be a non-empty string")
+
+        bindings = self._bindings
+        bound_id = bindings.get(key)
+        if bound_id is not None:
+            bound = self._pool._backends[self._pool._index[bound_id]]
+            if bound["healthy"]:
+                # 命中：只刷新最近使用顺序，不重新评分，O(1)。
+                bindings.move_to_end(key)
+                return {
+                    "id": bound["id"],
+                    "address": bound["address"],
+                    "port": bound["port"],
+                }
+
+        # 首次选择或故障转移：先取得一致性哈希决策（可能抛出
+        # NoAvailableBackendError），在此之前不改动任何绑定。
+        selected = self._hash.select(key)
+        selected_id = selected["id"]
+        if bound_id is None:
+            # 新绑定：超限时先淘汰最久未成功使用的 key（首项）。
+            if len(bindings) >= self._max_sessions:
+                bindings.popitem(last=False)
+            bindings[key] = selected_id
+        else:
+            # 故障转移：原子替换绑定并刷新为最近使用，绑定数不变。
+            bindings[key] = selected_id
+            bindings.move_to_end(key)
+        return selected
+
+    def bindings(self):
+        """按最久到最近成功使用顺序返回全部绑定的隔离副本。
+
+        每项是键序固定为 key、backend_id 的新字典；列表与字典都与
+        内部状态隔离，O(max_sessions) 时间与空间。
+        """
+        return [
+            {"key": key, "backend_id": backend_id}
+            for key, backend_id in self._bindings.items()
+        ]
+
+    def explain(self, key):
+        """返回一次会话绑定选择的可重放解释，不改变任何状态。
+
+        与 select 采用相同的 key 校验：非字符串抛出 TypeError，空
+        字符串抛出 ValueError，失败不改变池或调度器状态。结果是键序
+        固定为 policy、key、previous_backend_id、selected、outcome、
+        reason、evicted_key、base_decision 的新字典：policy 固定为
+        sticky_session；previous_backend_id 为该 key 当前绑定的后端
+        id，未绑定时为 None；命中时 selected 为绑定后端结果、reason
+        为 sticky_hit、base_decision 为 None；未绑定时 reason 为
+        new_binding，绑定后端不健康时 reason 为 unhealthy_failover，
+        两种重新选择的 base_decision 为当前一致性哈希 explain 结果；
+        evicted_key 给出紧随其后的成功 select 将淘汰的 key（命中、
+        替换绑定或未超限时为 None）。没有健康后端时不抛出
+        NoAvailableBackendError，selected 为 None、outcome 为 failed、
+        reason 为 no_healthy_backend。池状态不变时，解释与紧随其后的
+        select 逐字段一致。
+        """
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        if key == "":
+            raise ValueError("key must be a non-empty string")
+
+        bindings = self._bindings
+        bound_id = bindings.get(key)
+        if bound_id is not None:
+            bound = self._pool._backends[self._pool._index[bound_id]]
+            if bound["healthy"]:
+                return {
+                    "policy": "sticky_session",
+                    "key": key,
+                    "previous_backend_id": bound_id,
+                    "selected": {
+                        "id": bound["id"],
+                        "address": bound["address"],
+                        "port": bound["port"],
+                    },
+                    "outcome": "selected",
+                    "reason": "sticky_hit",
+                    "evicted_key": None,
+                    "base_decision": None,
+                }
+
+        # 未绑定或绑定后端不健康：复用一致性哈希的可重放解释。
+        base_decision = self._hash.explain(key)
+        if base_decision["selected"] is None:
+            return {
+                "policy": "sticky_session",
+                "key": key,
+                "previous_backend_id": bound_id,
+                "selected": None,
+                "outcome": "failed",
+                "reason": "no_healthy_backend",
+                "evicted_key": None,
+                "base_decision": base_decision,
+            }
+
+        reason = (
+            "unhealthy_failover" if bound_id is not None else "new_binding"
+        )
+        # 只有新绑定且绑定数已达上限时，紧随其后的 select 才会淘汰
+        # 当前首项（最久未成功使用的 key）；替换绑定不改变绑定数。
+        if bound_id is None and len(bindings) >= self._max_sessions:
+            evicted_key = next(iter(bindings))
+        else:
+            evicted_key = None
+        return {
+            "policy": "sticky_session",
+            "key": key,
+            "previous_backend_id": bound_id,
+            "selected": base_decision["selected"],
+            "outcome": "selected",
+            "reason": reason,
+            "evicted_key": evicted_key,
+            "base_decision": base_decision,
         }
 
 

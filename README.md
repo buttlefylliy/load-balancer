@@ -47,6 +47,17 @@
 * 单次选择最坏 O(n) 时间，除摘要计算所需的固定大小数据外额外空间 O(1)。
 * `explain(key)` 给出一次选择的可重放解释：key 采用与 `select` 完全相同的类型与值校验（非字符串 `TypeError`、空字符串 `ValueError`，失败不改变状态），但不维护任何按键累计的状态、不修改池或调度器。返回键序固定为 policy、key、candidates、selected、outcome、reason 的新字典：policy 固定为 `consistent_hash`；candidates 按后端声明顺序排列，每项键序固定为 backend_id、healthy、score，健康后端的 score 是保留前导零的 64 位小写十六进制 SHA-256 摘要，不健康后端不参与比较且 score 为 `null`；selected 保持 id、address、port 的既有键序，outcome 为 `selected`、reason 为 `highest_score`，最高分相同时取声明顺序最前的健康后端。池状态不变时，explain 的 selected 与 `select` 对同一 key 的结果逐字段一致。没有健康后端时 explain 不抛出 `NoAvailableBackendError`，而是返回全部候选且 selected 为 `null`、outcome 为 `failed`、reason 为 `no_healthy_backend`；`select` 在同一情形下仍抛出 `NoAvailableBackendError`。返回结果与内部状态隔离，相同 key 与相同池状态下多次查询逐字段相同；单次查询 O(n) 时间，除返回的 O(n) 解释结果外只使用 O(1) 额外空间。
 
+## 有界会话绑定（库接口）
+
+库接口提供 `StickySessionScheduler(pool, max_sessions)`，可从 `load_balancer` 直接导入；不接入命令行，`schedule` 命令的参数、输出、异常类型与退出码保持不变。它复用 `ConsistentHashScheduler` 完成首次选择与故障转移，并在其上维护至多 `max_sessions` 个有界会话绑定。
+
+* `max_sessions` 必须是排除布尔值的正整数，零、负数、布尔、浮点或其他类型均抛出 `ConfigurationError`；`pool` 不是 `BackendPool` 时与其他调度器一样抛出 `TypeError`。全部校验完成前不建立任何实例状态，构造失败不会产生部分对象。
+* `select(key)` 沿用一致性哈希的 key 校验：非字符串 `TypeError`、空字符串 `ValueError`，失败不改变状态。新 key 按当前健康后端做一致性哈希选择并绑定；已有绑定且绑定后端仍健康时始终返回绑定后端，即使健康集合增加（新恢复的后端在一致性哈希中本会胜出）也不迁移。绑定后端不健康时按既有一致性哈希规则在当前健康后端中重新选择并原子替换绑定，原后端恢复后不主动迁回。
+* 每次成功选择都把 key 置为最近使用；新绑定导致绑定数超过 `max_sessions` 时，先淘汰最久未成功使用的 key 再写入；相同事件序列的淘汰顺序确定一致。没有健康后端时抛出 `NoAvailableBackendError`，绑定内容与使用顺序都不改变；任何失败都不产生部分修改。成功返回的后端字典保持 id、address、port 键序。
+* 命中（绑定仍健康）为 O(1)；首次选择与故障转移为 O(n)（一致性哈希评分）。
+* `bindings()` 按最久到最近成功使用顺序返回绑定列表，每项是键序固定为 key、backend_id 的隔离副本新字典；完整查询与绑定存储均为 O(max_sessions)。
+* `explain(key)` 不改变任何状态，返回键序固定为 policy、key、previous_backend_id、selected、outcome、reason、evicted_key、base_decision 的新字典：policy 固定为 `sticky_session`；previous_backend_id 为当前绑定后端 id（未绑定时为 `null`）；reason 只能为 `sticky_hit`、`new_binding`、`unhealthy_failover` 或 `no_healthy_backend`。命中时 base_decision 为 `null`；重新选择时 base_decision 为当前一致性哈希的完整 explain 结果。evicted_key 给出紧随其后的成功 select 将淘汰的 key（命中、替换绑定或未达上限时为 `null`）。池状态不变时，解释与紧随其后的 select 逐字段一致；没有健康后端时返回 outcome 为 `failed` 的解释而不抛错。
+
 ## 连接生命周期表（库接口）
 
 库接口提供 `ConnectionTable(pool, idle_timeout, hard_timeout)`，可从 `load_balancer` 直接导入；它不接入命令行，`schedule` 命令的参数、输出、异常类型与退出码保持不变，也不改变 `LeastConnectionsScheduler` 各自独立的连接计数。
