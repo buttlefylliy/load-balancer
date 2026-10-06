@@ -22,12 +22,18 @@
   按会话键对当前健康后端评分（SHA-256 摘要取无符号大端整数，分数最大者
   胜出），不维护游标、连接计数或按键增长的缓存，单次选择最坏 O(n) 时间、
   额外空间 O(1)。
-* ``ConnectionStateError``：释放使活动连接数低于零时抛出。
+* ``ConnectionTable(pool, idle_timeout, hard_timeout)``：以五元组标识连接、
+  绑定后端池的连接生命周期表。时间只由显式 ``now`` 驱动；按五元组定位、
+  记录活动与关闭平均 O(1) 时间，``advance`` 与完整查询 O(n) 时间，
+  空间 O(n)。
+* ``ConnectionStateError``：连接状态非法时抛出（释放使活动连接数低于零、
+  对非 active 连接记录活动、五元组冲突、now 回退等）。
 """
 
 import argparse
 import bisect
 import hashlib
+import heapq
 import json
 import sys
 
@@ -40,6 +46,7 @@ __all__ = [
     "WeightedRoundRobinScheduler",
     "LeastConnectionsScheduler",
     "ConsistentHashScheduler",
+    "ConnectionTable",
 ]
 
 _POLICY = "round_robin"
@@ -65,7 +72,12 @@ class NoAvailableBackendError(Exception):
 
 
 class ConnectionStateError(Exception):
-    """连接计数状态非法：释放会使活动连接数低于零。"""
+    """连接状态非法。
+
+    释放会使活动连接数低于零，或连接生命周期操作与当前状态冲突
+    （对非 active 连接记录活动、同一五元组绑定到不同后端、
+    目标后端不健康、now 回退等）。
+    """
 
 
 def _validate_configs(configs):
@@ -418,6 +430,284 @@ class ConsistentHashScheduler:
             "id": backend["id"],
             "address": backend["address"],
             "port": backend["port"],
+        }
+
+
+_FLOW_FIELDS = ("src_address", "src_port", "dst_address", "dst_port", "protocol")
+_PROTOCOLS = ("tcp", "udp")
+_RECORD_FIELDS = (
+    "flow",
+    "backend_id",
+    "state",
+    "created_at",
+    "last_activity_at",
+    "ended_at",
+    "end_reason",
+)
+
+
+def _validate_flow(flow):
+    """校验五元组并返回键序固定的规范化新字典。
+
+    类型错误抛出 TypeError，值错误抛出 ValueError；不会修改调用方对象。
+    """
+    if not isinstance(flow, dict):
+        raise TypeError("flow must be a dict")
+    unknown = [key for key in flow if key not in _FLOW_FIELDS]
+    if unknown:
+        raise ValueError(f"flow: unknown field {unknown[0]!r}")
+    missing = [key for key in _FLOW_FIELDS if key not in flow]
+    if missing:
+        raise ValueError(f"flow: missing field {missing[0]!r}")
+
+    for field in ("src_address", "dst_address"):
+        address = flow[field]
+        if not isinstance(address, str):
+            raise TypeError(f"flow: {field} must be a string")
+        if address == "":
+            raise ValueError(f"flow: {field} must be a non-empty string")
+
+    for field in ("src_port", "dst_port"):
+        port = flow[field]
+        # bool 是 int 的子类，端口必须显式排除布尔值。
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise TypeError(
+                f"flow: {field} must be an integer between 1 and 65535"
+            )
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                f"flow: {field} must be an integer between 1 and 65535"
+            )
+
+    protocol = flow["protocol"]
+    if not isinstance(protocol, str):
+        raise TypeError("flow: protocol must be a string")
+    if protocol not in _PROTOCOLS:
+        raise ValueError("flow: protocol must be 'tcp' or 'udp'")
+
+    return {key: flow[key] for key in _FLOW_FIELDS}
+
+
+def _flow_key(flow):
+    return (
+        flow["src_address"],
+        flow["src_port"],
+        flow["dst_address"],
+        flow["dst_port"],
+        flow["protocol"],
+    )
+
+
+def _copy_record(record):
+    """按固定键序生成与内部状态隔离的记录副本。"""
+    return {
+        "flow": dict(record["flow"]),
+        "backend_id": record["backend_id"],
+        "state": record["state"],
+        "created_at": record["created_at"],
+        "last_activity_at": record["last_activity_at"],
+        "ended_at": record["ended_at"],
+        "end_reason": record["end_reason"],
+    }
+
+
+class ConnectionTable:
+    """以五元组标识连接、绑定 BackendPool 的连接生命周期表。
+
+    五元组为 src_address、src_port、dst_address、dst_port、protocol
+    （仅小写 "tcp"/"udp"）。时间只由调用方显式传入的 ``now`` 驱动，
+    不读墙上时钟；``now`` 必须是非布尔的非负整数且不得回退。
+
+    每条连接记录依次处于 active、closed 或 expired 状态。空闲期限
+    （last_activity_at + idle_timeout）或硬期限（created_at +
+    hard_timeout）不晚于 now 时连接到期：每个携带 now 的操作都先按
+    now 处理到期再执行，因此截止时刻的活动不能挽救连接；两个期限
+    同时命中时 end_reason 为 hard_timeout。
+
+    按五元组定位、记录活动与关闭平均 O(1) 时间（到期处理由最小堆
+    惰性完成），advance 与完整查询 O(n) 时间，空间 O(n)。
+    """
+
+    def __init__(self, pool, idle_timeout, hard_timeout):
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        for name, value in (
+            ("idle_timeout", idle_timeout),
+            ("hard_timeout", hard_timeout),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ConfigurationError(
+                    f"{name} must be a positive integer"
+                )
+        self._pool = pool
+        self._idle_timeout = idle_timeout
+        self._hard_timeout = hard_timeout
+        self._now = None
+        # 全部记录按建立顺序保存；_by_flow 只指向每个五元组的最新记录。
+        self._records = []
+        self._deadlines = []  # 与 _records 平行的 [空闲期限, 硬期限]
+        self._by_flow = {}
+        # (期限, 建立序号, 期限种类) 的最小堆，惰性失效：0 空闲、1 硬期限。
+        self._expiry_heap = []
+        self._active_counts = {
+            backend["id"]: 0 for backend in pool._backends
+        }
+
+    def _validate_now(self, now):
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be an integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        if self._now is not None and now < self._now:
+            raise ConnectionStateError("now must not move backwards")
+
+    def _process_expirations(self, now):
+        """把所有期限不晚于 now 的 active 连接置为 expired。
+
+        返回本次到期的内部记录列表（按建立顺序）；堆中已关闭或已被
+        更新的期限条目被惰性跳过。
+        """
+        expired = []
+        heap = self._expiry_heap
+        records = self._records
+        deadlines = self._deadlines
+        while heap and heap[0][0] <= now:
+            deadline, seq, kind = heapq.heappop(heap)
+            record = records[seq]
+            if record["state"] != "active":
+                continue
+            pair = deadlines[seq]
+            if pair[kind] != deadline:
+                continue
+            idle_deadline, hard_deadline = pair
+            record["state"] = "expired"
+            record["ended_at"] = now
+            # 两个期限同时命中时硬期限优先。
+            if hard_deadline <= now:
+                record["end_reason"] = "hard_timeout"
+            else:
+                record["end_reason"] = "idle_timeout"
+            self._active_counts[record["backend_id"]] -= 1
+            expired.append(record)
+        expired.sort(key=lambda record: record["seq"])
+        return expired
+
+    def open_connection(self, flow, backend_id, now):
+        """为五元组建立一条绑定到指定后端的 active 连接并返回记录副本。
+
+        后端必须存在且当前健康。同一五元组已有 active 连接时：后端相同
+        则直接返回原记录的副本（不产生任何状态变化），后端不同则抛出
+        ConnectionStateError。五元组最新记录已 closed 或 expired 时
+        建立新记录。所有校验失败都不改变任何状态。
+        """
+        self._validate_now(now)
+        prepared = _validate_flow(flow)
+        if not isinstance(backend_id, str):
+            raise TypeError("backend id must be a string")
+        index = self._pool._index.get(backend_id)
+        if index is None:
+            raise KeyError(backend_id)
+        if not self._pool._backends[index]["healthy"]:
+            raise ConnectionStateError(
+                f"backend {backend_id!r} is not healthy"
+            )
+
+        self._now = now
+        self._process_expirations(now)
+
+        key = _flow_key(prepared)
+        existing = self._by_flow.get(key)
+        if existing is not None and existing["state"] == "active":
+            if existing["backend_id"] == backend_id:
+                return _copy_record(existing)
+            raise ConnectionStateError(
+                "flow already has an active connection on backend "
+                f"{existing['backend_id']!r}"
+            )
+
+        seq = len(self._records)
+        record = {
+            "seq": seq,
+            "flow": prepared,
+            "backend_id": backend_id,
+            "state": "active",
+            "created_at": now,
+            "last_activity_at": now,
+            "ended_at": None,
+            "end_reason": None,
+        }
+        idle_deadline = now + self._idle_timeout
+        hard_deadline = now + self._hard_timeout
+        self._records.append(record)
+        self._deadlines.append([idle_deadline, hard_deadline])
+        heapq.heappush(self._expiry_heap, (idle_deadline, seq, 0))
+        heapq.heappush(self._expiry_heap, (hard_deadline, seq, 1))
+        self._by_flow[key] = record
+        self._active_counts[backend_id] += 1
+        return _copy_record(record)
+
+    def record_activity(self, flow, now):
+        """把五元组当前 active 连接的最后活动时间更新为 now。
+
+        先按 now 处理到期：截止时刻不晚于 now 的连接已到期，活动不能
+        挽救。连接不存在或不是 active 时抛出 ConnectionStateError。
+        """
+        self._validate_now(now)
+        prepared = _validate_flow(flow)
+        self._now = now
+        self._process_expirations(now)
+
+        record = self._by_flow.get(_flow_key(prepared))
+        if record is None or record["state"] != "active":
+            raise ConnectionStateError("flow has no active connection")
+        record["last_activity_at"] = now
+        idle_deadline = now + self._idle_timeout
+        self._deadlines[record["seq"]][0] = idle_deadline
+        heapq.heappush(self._expiry_heap, (idle_deadline, record["seq"], 0))
+        return _copy_record(record)
+
+    def close_connection(self, flow, now):
+        """把五元组当前 active 连接置为 closed 并返回记录副本。
+
+        先按 now 处理到期。重复关闭（连接已 closed 或 expired）是幂等
+        的，直接返回现有记录；五元组从未建立连接时抛出
+        ConnectionStateError。
+        """
+        self._validate_now(now)
+        prepared = _validate_flow(flow)
+        self._now = now
+        self._process_expirations(now)
+
+        record = self._by_flow.get(_flow_key(prepared))
+        if record is None:
+            raise ConnectionStateError("flow has no connection")
+        if record["state"] == "active":
+            record["state"] = "closed"
+            record["ended_at"] = now
+            record["end_reason"] = "closed"
+            self._active_counts[record["backend_id"]] -= 1
+        return _copy_record(record)
+
+    def advance(self, now):
+        """把时间推进到 now，返回本次到期的记录副本（按建立顺序）。"""
+        self._validate_now(now)
+        self._now = now
+        expired = self._process_expirations(now)
+        return [_copy_record(record) for record in expired]
+
+    def connections(self):
+        """按建立顺序返回全部记录的隔离副本。"""
+        return [_copy_record(record) for record in self._records]
+
+    def active_connections(self):
+        """按后端声明顺序返回每个后端的 active 连接数（新字典）。"""
+        return {
+            backend["id"]: self._active_counts[backend["id"]]
+            for backend in self._pool._backends
         }
 
 

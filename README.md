@@ -44,3 +44,16 @@
 * 调度器不维护轮询游标、连接计数或按键增长的缓存：同一键在后端集合与健康状态不变时，无论调用次数及与其他键的调用顺序如何，都返回键序固定为 id、address、port 的逐字段相同新字典。
 * 每次选择只比较当前健康后端：某后端被标记为不健康后，原本未选择它的键保持原选择，原本选择它的键在其余健康后端中重新映射；该后端恢复健康后，相同键按原评分规则重新选择，此前属于它的键确定性地回到它。健康变化在下一次 `select` 立即生效，选择过程不改写池或调度器状态。
 * 单次选择最坏 O(n) 时间，除摘要计算所需的固定大小数据外额外空间 O(1)。
+
+## 连接生命周期表（库接口）
+
+库接口提供 `ConnectionTable(pool, idle_timeout, hard_timeout)`，可从 `load_balancer` 直接导入；它不接入命令行，`schedule` 命令的参数、输出、异常类型与退出码保持不变，也不改变 `LeastConnectionsScheduler` 各自独立的连接计数。
+
+* 连接以五元组标识：`src_address`、`src_port`、`dst_address`、`dst_port`、`protocol`。两个地址必须是非空字符串；两个端口必须是 1 至 65535 的整数（布尔值被拒绝）；协议必须是小写的 `"tcp"` 或 `"udp"`。`idle_timeout` 与 `hard_timeout` 必须是正整数，非法时抛出 `ConfigurationError`。
+* 时间只由调用方显式传入的 `now` 驱动，不读墙上时钟。`now` 必须是非布尔的非负整数：类型错误抛出 `TypeError`，负值抛出 `ValueError`，`now` 回退抛出 `ConnectionStateError`。
+* `open_connection(flow, backend_id, now)` 创建 active 记录：后端必须存在（否则 `KeyError`）且当前健康（否则 `ConnectionStateError`）。同一五元组已有 active 连接时，后端相同则返回原记录且不产生状态变化，后端不同则抛出 `ConnectionStateError`；五元组最新记录已 closed 或 expired 时建立新记录。
+* `record_activity(flow, now)`、`close_connection(flow, now)` 与 `advance(now)` 管理生命周期。每个操作都先按 `now` 处理到期再执行：空闲期限（最后活动时间加 `idle_timeout`）或硬期限（建立时间加 `hard_timeout`）不晚于 `now` 的 active 连接被置为 expired，两个期限同时命中时 `end_reason` 为 `hard_timeout`，因此截止时刻的活动不能挽救连接。`advance` 按建立顺序返回本次到期的记录。
+* `record_activity` 只更新 active 连接的最后活动时间，对不存在的或非 active 的连接抛出 `ConnectionStateError`；`close_connection` 把 active 连接置为 closed（`end_reason` 为 `closed`），重复关闭幂等，五元组从未建立连接时抛出 `ConnectionStateError`。
+* 记录是键序固定为 `flow`、`backend_id`、`state`、`created_at`、`last_activity_at`、`ended_at`、`end_reason` 的字典，`flow` 内保持五元组顺序；active 记录的 `ended_at` 与 `end_reason` 为 `null`。`connections()` 按建立顺序返回全部记录的隔离副本，`active_connections()` 按后端声明顺序返回每个后端的 active 连接数（新字典）。
+* 五元组类型错误抛出 `TypeError`、值错误抛出 `ValueError`，非法超时抛出 `ConfigurationError`，未知后端抛出 `KeyError`；任何失败都不改变状态。
+* 按五元组定位、记录活动与关闭平均 O(1) 时间，`advance` 与完整查询 O(n) 时间，空间 O(n)。
