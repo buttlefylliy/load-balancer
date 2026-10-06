@@ -20,9 +20,19 @@
 
 ## 调度策略
 
-`schedule` 命令支持可选的 `--policy` 参数，省略时为 `round_robin`（输出与既有行为逐字节一致）；`--policy weighted_round_robin` 使用加权轮询。
+`schedule` 命令支持可选的 `--policy` 参数，省略时为 `round_robin`（输出与既有行为逐字节一致）；`--policy weighted_round_robin` 使用加权轮询；`--policy least_connections` 使用最少连接。
 
 * 后端配置可声明可选的 `weight` 字段：缺省按 1 处理，显式值必须是 1 至 10000 的整数；布尔、浮点、字符串、零、负数或越界值均属于 `ConfigurationError`（退出码 3）。
 * 加权轮询按配置声明顺序构造逻辑循环，每个后端连续占有 `weight` 个位置。例如健康后端 A、B、C 权重为 2、1、3 时，选择顺序为 A、A、B、C、C、C 后重复。
 * 调度器从上次成功位置的下一个逻辑位置开始，整段跳过不健康后端占有的位置；`set_healthy` 立即影响下一次选择，恢复健康的后端从游标后方下一次遇到的自身位置重新参与，不补发停用期间错过的次数。
 * 实现不按权重展开保存重复后端项：调度器额外空间 O(n)，单次选择最坏 O(n)。
+
+### 最少连接（least_connections）
+
+* `LeastConnectionsScheduler(pool)` 为池中每个后端维护从零开始的活动连接数，构造 O(n) 时间、O(n) 空间，不展开保存重复项。
+* `select()` 只考察当前健康的后端，取活动连接数最小者，计数相同时按声明顺序取最前者；选定后先把计数加一，再返回与既有调度器相同键序（id、address、port）的新字典。单次选择最坏 O(n) 时间、额外空间 O(1)。没有健康后端时抛出 `NoAvailableBackendError`，所有计数与选择状态不变。
+* `release(backend_id)` 按 id 释放一个连接，只把对应计数减一，O(1) 时间。id 不是字符串抛出 `TypeError`，字符串 id 不存在抛出 `KeyError`；计数已为零时再释放抛出公开的 `ConnectionStateError`，且任何计数都不改变。
+* `active_connections()` 返回与内部状态隔离的新字典，键按声明顺序排列，值为非负整数，O(n) 时间。
+* `weight` 仍按既有规则校验，但不参与本策略的比较。
+* 健康状态变化立即影响后续选择，但不清除或改写已有计数：不健康的后端仍允许释放既有连接，恢复健康后继续以保留的计数参与比较。
+* `schedule --policy least_connections` 把一次命令中的 count 次选择视为依次建立且未释放的连接，输出与既有策略相同键序的紧凑 JSON；没有可用后端时仍以退出码 4 结束且不在 stdout 留下部分结果。

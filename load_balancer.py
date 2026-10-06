@@ -15,6 +15,16 @@
   额外空间 O(1)。
 * ``WeightedRoundRobinScheduler(pool)``：按 weight 构造逻辑循环的加权轮询
   调度器，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间 O(1)。
+* ``ConnectionStateError``：释放连接会使活动连接数降为负数时抛出。
+* ``LeastConnectionsScheduler(pool)``：最少连接调度器，为每个后端维护
+  从零开始的活动连接数，构造 O(n) 时间、O(n) 空间。
+* ``LeastConnectionsScheduler.select()``：在当前健康后端中取活动连接数
+  最小者（计数相同按声明顺序取最前者），先加一再返回，最坏 O(n) 时间、
+  额外空间 O(1)。
+* ``LeastConnectionsScheduler.release(backend_id)``：按 id 释放一个连接，
+  O(1) 时间。
+* ``LeastConnectionsScheduler.active_connections()``：返回与内部状态隔离、
+  按声明顺序排列的全部活动连接数，O(n) 时间。
 """
 
 import argparse
@@ -25,13 +35,16 @@ import sys
 __all__ = [
     "ConfigurationError",
     "NoAvailableBackendError",
+    "ConnectionStateError",
     "BackendPool",
     "RoundRobinScheduler",
     "WeightedRoundRobinScheduler",
+    "LeastConnectionsScheduler",
 ]
 
 _POLICY = "round_robin"
 _WEIGHTED_POLICY = "weighted_round_robin"
+_LEAST_POLICY = "least_connections"
 _FIELDS = ("id", "address", "port", "healthy")
 _OPTIONAL_FIELDS = ("weight",)
 _KNOWN_FIELDS = _FIELDS + _OPTIONAL_FIELDS
@@ -48,6 +61,10 @@ class ConfigurationError(ValueError):
 
 class NoAvailableBackendError(Exception):
     """一次有界扫描内没有找到任何健康后端。"""
+
+
+class ConnectionStateError(Exception):
+    """连接状态非法：释放连接会使某个后端的活动连接数降为负数。"""
 
 
 def _validate_configs(configs):
@@ -268,6 +285,83 @@ class WeightedRoundRobinScheduler:
         raise NoAvailableBackendError("no healthy backend available")
 
 
+class LeastConnectionsScheduler:
+    """最少连接调度器。
+
+    按声明顺序为每个后端维护一个从零开始的活动连接数（O(n) 空间，
+    不展开保存重复项）。每次选择只考察当前健康的后端，取活动连接数
+    最小者，计数相同时按声明顺序取最前者；选定后先把该后端的计数
+    加一，再返回结果。健康标记的变更立即影响后续选择，但不清除或
+    改写已有计数：不健康的后端仍允许释放既有连接，恢复健康后继续
+    以保留的计数参与比较。weight 仍由 BackendPool 按既有规则校验，
+    但不参与本策略的比较。
+    """
+
+    def __init__(self, pool):
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        self._pool = pool
+        self._counts = [0] * len(pool._backends)
+
+    def select(self):
+        """在当前健康后端中选择活动连接数最小者。
+
+        结果是键序固定为 id、address、port 的新字典；返回前先把被选
+        后端的活动连接数加一。没有健康后端时抛出
+        NoAvailableBackendError，所有计数与选择状态均不改变。
+        """
+        backends = self._pool._backends
+        counts = self._counts
+        best = -1
+        best_count = 0
+        for index, backend in enumerate(backends):
+            if not backend["healthy"]:
+                continue
+            if best == -1 or counts[index] < best_count:
+                best = index
+                best_count = counts[index]
+        if best == -1:
+            raise NoAvailableBackendError("no healthy backend available")
+        counts[best] = best_count + 1
+        backend = backends[best]
+        return {
+            "id": backend["id"],
+            "address": backend["address"],
+            "port": backend["port"],
+        }
+
+    def release(self, backend_id):
+        """按 id 释放一个活动连接，只把对应计数减一。
+
+        后端 id 不是字符串时抛出 TypeError；字符串 id 不存在时抛出
+        KeyError；计数已为零时再释放属于状态错误，抛出
+        ConnectionStateError 且任何计数都不改变。不健康的后端同样
+        允许释放既有连接。
+        """
+        if not isinstance(backend_id, str):
+            raise TypeError("backend id must be a string")
+        index = self._pool._index.get(backend_id)
+        if index is None:
+            raise KeyError(backend_id)
+        count = self._counts[index]
+        if count == 0:
+            raise ConnectionStateError(
+                f"backend {backend_id!r} has no active connection to release"
+            )
+        self._counts[index] = count - 1
+
+    def active_connections(self):
+        """返回全部后端的活动连接数。
+
+        结果是与内部状态隔离的新字典，键按后端声明顺序排列，
+        值为非负整数。
+        """
+        return {
+            backend["id"]: count
+            for backend, count in zip(self._pool._backends, self._counts)
+        }
+
+
 def _positive_int(value):
     try:
         number = int(value)
@@ -330,7 +424,7 @@ def _build_parser():
     )
     schedule.add_argument(
         "--policy",
-        choices=(_POLICY, _WEIGHTED_POLICY),
+        choices=(_POLICY, _WEIGHTED_POLICY, _LEAST_POLICY),
         default=_POLICY,
         help="调度策略，省略时为 round_robin",
     )
@@ -369,6 +463,8 @@ def _handle_schedule(args):
 
     if args.policy == _WEIGHTED_POLICY:
         scheduler = WeightedRoundRobinScheduler(pool)
+    elif args.policy == _LEAST_POLICY:
+        scheduler = LeastConnectionsScheduler(pool)
     else:
         scheduler = RoundRobinScheduler(pool)
     selections = []
