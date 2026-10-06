@@ -58,6 +58,16 @@
 * `bindings()` 按最久到最近成功使用顺序返回绑定列表，每项是键序固定为 key、backend_id 的隔离副本新字典；完整查询与绑定存储均为 O(max_sessions)。
 * `explain(key)` 不改变任何状态，返回键序固定为 policy、key、previous_backend_id、selected、outcome、reason、evicted_key、base_decision 的新字典：policy 固定为 `sticky_session`；previous_backend_id 为当前绑定后端 id（未绑定时为 `null`）；reason 只能为 `sticky_hit`、`new_binding`、`unhealthy_failover` 或 `no_healthy_backend`。命中时 base_decision 为 `null`；重新选择时 base_decision 为当前一致性哈希的完整 explain 结果。evicted_key 给出紧随其后的成功 select 将淘汰的 key（命中、替换绑定或未达上限时为 `null`）。池状态不变时，解释与紧随其后的 select 逐字段一致；没有健康后端时返回 outcome 为 `failed` 的解释而不抛错。
 
+## 跨后端有界重试链（库接口）
+
+库接口提供 `RetryChainScheduler(pool, max_attempts)` 与 `RetryExhaustedError`，均可从 `load_balancer` 直接导入；仅作库接口，不接入 `schedule`，命令的参数、输出、异常类型与退出码保持不变，也不改变任何既有功能。调度器自身无状态：本链已失败的后端由调用方在每次调用时显式传入，选择不修改池或调度器状态。
+
+* `pool` 不是 `BackendPool` 时与其他调度器一样抛出 `TypeError`。`max_attempts` 包含首次选择，只接受 1 至 10000 的非布尔整数：布尔、浮点、字符串、零、负数或越界值均抛出 `ConfigurationError`。全部校验完成前不建立任何实例状态，构造失败不会产生部分对象。
+* `next_backend(key, failed_backend_ids)` 返回当前健康且未在本链失败的后端，结果保持 id、address、port 键序。key 沿用一致性哈希校验（非字符串 `TypeError`、空字符串 `ValueError`）。`failed_backend_ids` 必须是列表：非列表抛 `TypeError`，元素必须是池内字符串 id（非字符串 `TypeError`、未知 id `KeyError`），重复项抛 `ValueError`，长度超过 `max_attempts` 抛 `ValueError`。全部输入校验完成后才做选择判定，调用不修改池、调度器或调用方列表。
+* 选择沿用一致性哈希评分（`[key, backend_id]` 的紧凑 JSON 经 SHA-256 取无符号大端整数），最高分胜出，同分取声明顺序最前者；已在本链失败的后端即使恢复健康也不在同一链重选。池中没有任何健康后端时抛 `NoAvailableBackendError`；失败链长度达到 `max_attempts`（首次选择在内的尝试次数已用完）或健康后端均已在本链失败时抛 `RetryExhaustedError`。
+* `explain(key, failed_backend_ids)` 使用相同校验与选择规则，但无候选时返回解释而不抛出选择异常。结果是键序固定为 policy、key、failed_backend_ids、candidates、selected、outcome、reason 的新字典：policy 为 `retry_chain`；`failed_backend_ids` 是保持原顺序的隔离副本；candidates 按声明顺序给出，每项键序固定为 backend_id、healthy、failed、score，健康后端的 score 为保留前导零的 64 位小写十六进制摘要，不健康后端 score 为 `null`。成功时 selected 与同入参的 `next_backend` 逐字段一致，reason 为 `initial_selection`（失败链为空）或 `retry_after_failure`；失败时 selected 为 `null`、outcome 为 `failed`，没有任何健康后端时 reason 为 `no_healthy_backend`，其余耗尽情形为 `retries_exhausted`。结果与内部状态隔离且确定。
+* `next_backend` 为 O(n+m) 时间与 O(m) 额外空间；`explain` 为 O(n+m) 时间，除 O(n) 返回值外占 O(m) 额外空间，其中 m 为失败链长度且受 `max_attempts` 限制。
+
 ## 连接生命周期表（库接口）
 
 库接口提供 `ConnectionTable(pool, idle_timeout, hard_timeout)`，可从 `load_balancer` 直接导入；它不接入命令行，`schedule` 命令的参数、输出、异常类型与退出码保持不变，也不改变 `LeastConnectionsScheduler` 各自独立的连接计数。
