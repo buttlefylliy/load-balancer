@@ -8,7 +8,9 @@
 
 * ``ConfigurationError``：后端配置非法时抛出。
 * ``NoAvailableBackendError``：池中没有任何健康后端时抛出。
-* ``BackendPool(configs)``：由后端配置列表建池，O(n) 时间、O(n) 空间。
+* ``BackendOverloadedError``：存在健康后端但全部达到自身并发上限时抛出。
+* ``BackendPool(configs)``：由后端配置列表建池，O(n) 时间、O(n) 空间；
+  可选的 max_connections 为每后端声明并发上限，省略表示不限量。
 * ``BackendPool.set_healthy(backend_id, healthy)``：按 id 原子更新健康标记。
 * ``RoundRobinScheduler(pool)``：绑定后端池的轮询调度器。
 * ``RoundRobinScheduler.select()``：返回下一个健康后端，最坏 O(n) 时间、
@@ -16,8 +18,9 @@
 * ``WeightedRoundRobinScheduler(pool)``：按 weight 构造逻辑循环的加权轮询
   调度器，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间 O(1)。
 * ``LeastConnectionsScheduler(pool)``：最少连接调度器，为每个后端维护
-  从零开始的活动连接数，额外空间 O(n)，单次选择最坏 O(n) 时间、
-  额外空间 O(1)，单次释放 O(1)。
+  从零开始的活动连接数，只在健康且未达 max_connections 上限的后端中
+  取计数最小者，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间
+  O(1)，单次释放 O(1)。
 * ``ConsistentHashScheduler(pool)``：一致性哈希调度器，``select(key)``
   按会话键对当前健康后端评分（SHA-256 摘要取无符号大端整数，分数最大者
   胜出），不维护游标、连接计数或按键增长的缓存，单次选择最坏 O(n) 时间、
@@ -40,6 +43,7 @@ import sys
 __all__ = [
     "ConfigurationError",
     "NoAvailableBackendError",
+    "BackendOverloadedError",
     "ConnectionStateError",
     "BackendPool",
     "RoundRobinScheduler",
@@ -53,7 +57,7 @@ _POLICY = "round_robin"
 _WEIGHTED_POLICY = "weighted_round_robin"
 _LEAST_POLICY = "least_connections"
 _FIELDS = ("id", "address", "port", "healthy")
-_OPTIONAL_FIELDS = ("weight",)
+_OPTIONAL_FIELDS = ("weight", "max_connections")
 _KNOWN_FIELDS = _FIELDS + _OPTIONAL_FIELDS
 _COMPLEXITY = (
     "复杂度：建池为 O(n) 时间与 O(n) 空间；"
@@ -69,6 +73,10 @@ class ConfigurationError(ValueError):
 
 class NoAvailableBackendError(Exception):
     """一次有界扫描内没有找到任何健康后端。"""
+
+
+class BackendOverloadedError(Exception):
+    """存在健康后端，但它们的活动连接数都已达到自身上限。"""
 
 
 class ConnectionStateError(Exception):
@@ -147,6 +155,24 @@ def _validate_configs(configs):
                 f"{location}: weight must be an integer between 1 and 10000"
             )
 
+        # max_connections 为可选字段，缺省（None）表示不限量；
+        # 布尔值是 int 的子类，必须显式排除。
+        has_capacity = "max_connections" in entry
+        max_connections = entry["max_connections"] if has_capacity else None
+        if has_capacity:
+            if isinstance(max_connections, bool) or not isinstance(
+                max_connections, int
+            ):
+                raise ConfigurationError(
+                    f"{location}: max_connections must be an integer "
+                    "between 1 and 1000000"
+                )
+            if not 1 <= max_connections <= 1000000:
+                raise ConfigurationError(
+                    f"{location}: max_connections must be an integer "
+                    "between 1 and 1000000"
+                )
+
         if backend_id in seen_ids:
             raise ConfigurationError(
                 f"duplicate backend id: {backend_id!r}"
@@ -160,6 +186,7 @@ def _validate_configs(configs):
                 "port": port,
                 "healthy": healthy,
                 "weight": weight,
+                "max_connections": max_connections,
             }
         )
 
@@ -302,12 +329,14 @@ class LeastConnectionsScheduler:
     """最少连接调度器。
 
     按声明顺序为每个后端维护一个从零开始的活动连接数（O(n) 空间，
-    不展开保存重复项）。每次选择只考察当前健康的后端，取活动连接数
-    最小者，计数相同时取声明顺序最前者；选定后先把该后端的计数加一，
-    再返回结果。健康标记的变更立即影响后续选择，但不清除或改写已有
-    计数；不健康的后端仍允许释放既有连接，恢复健康后以保留的计数
-    继续参与比较。没有健康后端时抛出 NoAvailableBackendError，
-    所有计数与选择状态均不改变。
+    不展开保存重复项）。每次选择只考察当前健康且活动连接数低于自身
+    max_connections 上限的后端（省略上限的后端始终通过容量筛选），
+    取活动连接数最小者，计数相同时取声明顺序最前者；选定后先把该
+    后端的计数加一，再返回结果。健康标记的变更立即影响后续选择，但
+    不清除或改写已有计数；不健康的后端仍允许释放既有连接，恢复健康
+    后以保留的计数与上限重新参与比较。没有健康后端时抛出
+    NoAvailableBackendError；存在健康后端但全部达到上限时抛出
+    BackendOverloadedError，两种失败均不改变任何计数。
     """
 
     def __init__(self, pool):
@@ -317,22 +346,33 @@ class LeastConnectionsScheduler:
         self._counts = [0] * len(pool._backends)
 
     def select(self):
-        """选择当前健康且活动连接数最小的后端。
+        """选择当前健康且未满容量、活动连接数最小的后端。
 
         结果是键序固定为 id、address、port 的新字典；成功后被选后端的
         活动连接数先加一再返回。没有健康后端时抛出
-        NoAvailableBackendError，所有计数均不改变。
+        NoAvailableBackendError；存在健康后端但计数全部达到各自
+        max_connections 上限时抛出 BackendOverloadedError。两种失败
+        都不改变任何计数。
         """
         backends = self._pool._backends
         counts = self._counts
         chosen = -1
+        saw_healthy = False
         for index, backend in enumerate(backends):
-            if backend["healthy"] and (
-                chosen < 0 or counts[index] < counts[chosen]
-            ):
+            if not backend["healthy"]:
+                continue
+            saw_healthy = True
+            limit = backend["max_connections"]
+            if limit is not None and counts[index] >= limit:
+                continue
+            if chosen < 0 or counts[index] < counts[chosen]:
                 chosen = index
         if chosen < 0:
-            raise NoAvailableBackendError("no healthy backend available")
+            if not saw_healthy:
+                raise NoAvailableBackendError("no healthy backend available")
+            raise BackendOverloadedError(
+                "all healthy backends are at capacity"
+            )
         counts[chosen] += 1
         backend = backends[chosen]
         return {
@@ -822,6 +862,8 @@ def _handle_schedule(args):
             selections.append(scheduler.select())
     except NoAvailableBackendError as exc:
         _emit_error("NoAvailableBackendError", exc, 4)
+    except BackendOverloadedError as exc:
+        _emit_error("BackendOverloadedError", exc, 5)
 
     result = {"policy": args.policy, "selections": selections}
     sys.stdout.write(
