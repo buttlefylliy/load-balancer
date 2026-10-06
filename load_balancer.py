@@ -36,6 +36,17 @@
   故障转移 O(n)（一致性哈希评分），超限时淘汰最久未成功使用的 key；
   ``bindings()`` 按最久到最近使用顺序返回 O(max_sessions) 的隔离副本，
   ``explain(key)`` 返回键序固定的可重放解释且不改变状态。
+* ``RetryChainScheduler(pool, max_attempts)``：跨后端有界重试链调度器
+  （仅库接口），本身无状态：``next_backend(key, failed_backend_ids)``
+  在当前健康且未在本链失败的后端中沿用一致性哈希评分给出下一次尝试，
+  max_attempts 包含首次选择；无健康后端抛出 NoAvailableBackendError，
+  达到尝试上限或健康后端均已失败时抛出 RetryExhaustedError，两种失败
+  与成功调用都不修改任何状态；单次查询 O(n+m) 时间、O(m) 额外空间。
+  ``explain(key, failed_backend_ids)`` 使用相同规则但无候选时返回解释
+  而不抛选择异常，结果键序固定、与内部状态隔离，除 O(n) 返回结果外
+  占 O(m) 额外空间，m 受 max_attempts 限制。
+* ``RetryExhaustedError``：有界重试链达到尝试上限，或当前健康后端均已
+  在本链失败时抛出。
 * ``ConnectionTable(pool, idle_timeout, hard_timeout)``：以五元组标识连接、
   绑定后端池的连接生命周期表。时间只由显式 ``now`` 驱动；按五元组定位、
   记录活动与关闭平均 O(1) 时间，``advance`` 与完整查询 O(n) 时间，
@@ -67,6 +78,8 @@ __all__ = [
     "LeastConnectionsScheduler",
     "ConsistentHashScheduler",
     "StickySessionScheduler",
+    "RetryChainScheduler",
+    "RetryExhaustedError",
     "ConnectionTable",
     "HealthCheckTracker",
 ]
@@ -95,6 +108,10 @@ class NoAvailableBackendError(Exception):
 
 class BackendOverloadedError(Exception):
     """存在健康后端，但它们的活动连接数都已达到自身上限。"""
+
+
+class RetryExhaustedError(Exception):
+    """有界重试链已耗尽：达到尝试上限，或健康后端均已在本链失败。"""
 
 
 class ConnectionStateError(Exception):
@@ -817,6 +834,206 @@ class StickySessionScheduler:
             "reason": reason,
             "evicted_key": evicted_key,
             "base_decision": base_decision,
+        }
+
+
+class RetryChainScheduler:
+    """跨后端有界重试链调度器（仅库接口，不接入 schedule）。
+
+    调度器本身无状态：重试进度完全由调用方在每次尝试后以
+    failed_backend_ids 显式给出，调度器不保存游标、计数或按链累计的
+    任何状态，因此调用（无论成功还是失败）都不修改池或本调度器。
+
+    选择规则沿用 ConsistentHashScheduler：对每个当前健康且未在本链
+    失败的后端，以会话键与后端 id 组成的 JSON 数组计算 SHA-256 摘要
+    （无符号大端整数），最高分胜出，同分取声明顺序最前者；address、
+    port、weight 与声明位置都不参与评分。已失败后端即使在本链期间
+    恢复健康也不会被同一链重选（它仍在 failed_backend_ids 中）。
+
+    max_attempts 包含首次选择，即可返回的尝试序号为 1..max_attempts：
+    失败链长度达到 max_attempts 时不再有下一次尝试。池中完全没有健康
+    后端时抛出 NoAvailableBackendError；尚有健康后端但失败链已达上限，
+    或健康后端全部已在本链失败时抛出 RetryExhaustedError。
+
+    单次 next_backend 为 O(n+m) 时间、O(m) 额外空间（m 为失败链长度，
+    受 max_attempts 限制）；explain 除 O(n) 的返回结果外占 O(m)。
+    """
+
+    def __init__(self, pool, max_attempts):
+        # 先完成 pool 与 max_attempts 的全部校验，再建立任何实例状态；
+        # 校验失败时对象不会被部分构造。
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        # bool 是 int 的子类，尝试上限必须显式排除布尔值。
+        if (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or not 1 <= max_attempts <= 10000
+        ):
+            raise ConfigurationError(
+                "max_attempts must be an integer between 1 and 10000"
+            )
+        self._pool = pool
+        self._max_attempts = max_attempts
+
+    def _validate_chain(self, key, failed_backend_ids):
+        """先校验全部输入，再返回失败 id 的隔离集合。
+
+        key 校验与一致性哈希一致；失败链必须是列表，元素必须是池内
+        字符串 id。任一输入非法都抛出对应异常，不产生部分结果，也不
+        修改调用方列表；校验通过后才允许进入选择判定。
+        """
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        if key == "":
+            raise ValueError("key must be a non-empty string")
+        if not isinstance(failed_backend_ids, list):
+            raise TypeError("failed_backend_ids must be a list")
+        failed = set()
+        for backend_id in failed_backend_ids:
+            if not isinstance(backend_id, str):
+                raise TypeError("failed backend ids must be strings")
+            if backend_id not in self._pool._index:
+                raise KeyError(backend_id)
+            if backend_id in failed:
+                raise ValueError(
+                    f"duplicate failed backend id: {backend_id!r}"
+                )
+            failed.add(backend_id)
+        if len(failed_backend_ids) > self._max_attempts:
+            raise ValueError(
+                "failed_backend_ids length must not exceed max_attempts"
+            )
+        return failed
+
+    def next_backend(self, key, failed_backend_ids):
+        """返回重试链上的下一个健康且未失败的后端。
+
+        key 沿用一致性哈希校验（非字符串 TypeError、空字符串
+        ValueError）；failed_backend_ids 必须是列表，元素必须是池内
+        字符串 id，类型错误抛出 TypeError，重复项抛出 ValueError，
+        未知项抛出 KeyError，长度超过 max_attempts 抛出 ValueError。
+        全部输入校验通过后才做选择判定。结果是键序固定为 id、
+        address、port 的新字典；调用不修改池、调度器或调用方列表。
+        池中完全没有健康后端时抛出 NoAvailableBackendError；尚有健康
+        后端但失败链已达 max_attempts（没有剩余尝试名额）或健康后端
+        均已在本链失败时抛出 RetryExhaustedError。O(n+m) 时间、
+        O(m) 额外空间。
+        """
+        failed = self._validate_chain(key, failed_backend_ids)
+        backends = self._pool._backends
+        chosen_id = None
+        best_score = -1
+        saw_healthy = False
+        for backend in backends:
+            if not backend["healthy"]:
+                continue
+            saw_healthy = True
+            if backend["id"] in failed:
+                continue
+            payload = json.dumps(
+                [key, backend["id"]],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            score = int.from_bytes(
+                hashlib.sha256(payload).digest(), "big", signed=False
+            )
+            # 只在严格更大时替换，摘要相同保留声明顺序最前者。
+            if score > best_score:
+                best_score = score
+                chosen_id = backend["id"]
+        if not saw_healthy:
+            raise NoAvailableBackendError("no healthy backend available")
+        if len(failed) >= self._max_attempts or chosen_id is None:
+            raise RetryExhaustedError(
+                "retry chain exhausted all allowed attempts"
+            )
+        backend = backends[self._pool._index[chosen_id]]
+        return {
+            "id": backend["id"],
+            "address": backend["address"],
+            "port": backend["port"],
+        }
+
+    def explain(self, key, failed_backend_ids):
+        """返回一次重试链选择的可重放解释，不改变任何状态。
+
+        采用与 next_backend 完全相同的输入校验与选择规则，但无候选时
+        返回解释而不抛出选择异常。结果是键序固定为 policy、key、
+        failed_backend_ids、candidates、selected、outcome、reason 的新
+        字典：policy 固定为 retry_chain；failed_backend_ids 是与入参
+        隔离的新列表（保持调用方给定顺序）；candidates 按后端声明顺序
+        排列，每项键序固定为 backend_id、healthy、failed、score，健康
+        且未失败后端的 score 为保留前导零的 64 位小写十六进制 SHA-256
+        摘要，其余后端 score 为 None。存在候选时 selected 与同输入的
+        next_backend 返回逐字段一致，outcome 为 selected；失败链为空时
+        reason 为 initial_selection，否则为 retry_after_failure。完全没
+        有健康后端时 selected 为 None、outcome 为 failed、reason 为
+        no_healthy_backend；尚有健康后端但尝试名额已用尽或健康后端均已
+        失败时 reason 为 retries_exhausted。结果与内部状态完全隔离且
+        确定；除 O(n) 返回结果外占 O(m) 额外空间。
+        """
+        failed = self._validate_chain(key, failed_backend_ids)
+        backends = self._pool._backends
+        candidates = []
+        chosen_id = None
+        best_score = -1
+        saw_healthy = False
+        for backend in backends:
+            healthy = backend["healthy"]
+            already_failed = backend["id"] in failed
+            score_hex = None
+            if healthy:
+                saw_healthy = True
+                if not already_failed:
+                    payload = json.dumps(
+                        [key, backend["id"]],
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    digest = hashlib.sha256(payload).digest()
+                    score = int.from_bytes(digest, "big", signed=False)
+                    score_hex = digest.hex()
+                    # 只在严格更大时替换，摘要相同保留声明顺序最前者。
+                    if score > best_score:
+                        best_score = score
+                        chosen_id = backend["id"]
+            candidates.append(
+                {
+                    "backend_id": backend["id"],
+                    "healthy": healthy,
+                    "failed": already_failed,
+                    "score": score_hex,
+                }
+            )
+        if not saw_healthy:
+            selected = None
+            outcome = "failed"
+            reason = "no_healthy_backend"
+        elif len(failed) >= self._max_attempts or chosen_id is None:
+            selected = None
+            outcome = "failed"
+            reason = "retries_exhausted"
+        else:
+            backend = backends[self._pool._index[chosen_id]]
+            selected = {
+                "id": backend["id"],
+                "address": backend["address"],
+                "port": backend["port"],
+            }
+            outcome = "selected"
+            reason = (
+                "retry_after_failure" if failed else "initial_selection"
+            )
+        return {
+            "policy": "retry_chain",
+            "key": key,
+            "failed_backend_ids": list(failed_backend_ids),
+            "candidates": candidates,
+            "selected": selected,
+            "outcome": outcome,
+            "reason": reason,
         }
 
 
