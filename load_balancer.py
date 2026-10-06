@@ -16,7 +16,11 @@
 * ``RoundRobinScheduler.select()``：返回下一个健康后端，最坏 O(n) 时间、
   额外空间 O(1)。
 * ``WeightedRoundRobinScheduler(pool)``：按 weight 构造逻辑循环的加权轮询
-  调度器，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间 O(1)。
+  调度器，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间 O(1)；
+  ``explain()`` 返回键序固定的可重放解释（调用前游标、全部候选的权重
+  段边界、selected、outcome、reason、next_cursor），与 select 同规则
+  但无健康后端时不抛错，不推进游标或改变任何状态，单次查询 O(n) 时间、
+  除返回结果外额外空间 O(1)。
 * ``LeastConnectionsScheduler(pool)``：最少连接调度器，为每个后端维护
   从零开始的活动连接数，只在健康且未达 max_connections 上限的后端中
   取计数最小者，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间
@@ -309,6 +313,12 @@ class WeightedRoundRobinScheduler:
     n 个后端：单次选择最坏 O(n) 时间、额外空间 O(1)。恢复健康标记的
     变更立即影响下一次选择；没有健康后端时抛出 NoAvailableBackendError
     且游标不变。
+
+    ``explain()`` 复用与 select 完全相同的起点定位、整段跳过与回绕
+    规则，但不抛出调度异常、不推进游标：返回包含调用前游标、全部候选
+    的权重段边界与选中结果的可重放解释字典，健康变化立即体现在下一次
+    解释中；池状态不变时，解释与紧随其后的 select 选中同一后端，且
+    next_cursor 即该次 select 将写入的位置。
     """
 
     def __init__(self, pool):
@@ -355,6 +365,94 @@ class WeightedRoundRobinScheduler:
             else:
                 position = self._offsets[index]
         raise NoAvailableBackendError("no healthy backend available")
+
+    def explain(self):
+        """返回一次加权轮询选择的可重放解释，不推进游标或改变任何状态。
+
+        结果是键序固定为 policy、cursor、candidates、selected、outcome、
+        reason、next_cursor 的新字典：policy 固定为 weighted_round_robin；
+        cursor 为调用前的逻辑游标（上一次成功选择的位置，初始为 -1）；
+        candidates 按后端声明顺序排列，每项键序固定为 backend_id、
+        healthy、weight、segment_start、segment_end，其中 segment_start
+        与 segment_end 是包含起点、不包含终点的整数边界
+        （segment_end 为下一个后端段首，末段为权重循环总长），完整
+        覆盖权重循环，不按权重展开重复项。解释从 cursor 的后继位置
+        出发，沿用与 select 完全相同的整段跳过与回绕规则：存在健康
+        后端时 selected 是键序固定为 id、address、port 的新字典，
+        outcome 为 selected，reason 为 weighted_round_robin，
+        next_cursor 为下次成功选择将写入的逻辑位置；池状态不变时
+        紧随其后的 select 返回同一后端并把游标推进到 next_cursor。
+        全部后端均不健康时不抛出 NoAvailableBackendError：返回全部
+        候选，selected 为 None、outcome 为 failed、reason 为
+        no_healthy_backend、next_cursor 等于 cursor；同一情形下
+        select 仍抛出 NoAvailableBackendError。解释不修改游标、池或
+        健康标记，修改返回对象不污染后续结果；池状态不变时重复调用
+        逐字段一致，set_healthy 的变化立即反映在下一次解释中。
+        单次查询 O(n) 时间，除返回的 O(n) 解释结果外只使用 O(1)
+        额外空间。
+        """
+        backends = self._pool._backends
+        size = len(backends)
+        offsets = self._offsets
+        total = self._total
+        cursor = self._cursor
+        candidates = []
+        for index, backend in enumerate(backends):
+            segment_end = offsets[index + 1] if index + 1 < size else total
+            candidates.append(
+                {
+                    "backend_id": backend["id"],
+                    "healthy": backend["healthy"],
+                    "weight": backend["weight"],
+                    "segment_start": offsets[index],
+                    "segment_end": segment_end,
+                }
+            )
+        if total == 0:
+            return {
+                "policy": "weighted_round_robin",
+                "cursor": cursor,
+                "candidates": candidates,
+                "selected": None,
+                "outcome": "failed",
+                "reason": "no_healthy_backend",
+                "next_cursor": cursor,
+            }
+        # 起点定位、整段跳过与回绕与 select 完全一致，只是不写回游标。
+        position = (cursor + 1) % total
+        index = bisect.bisect_right(offsets, position) - 1
+        for _ in range(size):
+            backend = backends[index]
+            if backend["healthy"]:
+                selected = {
+                    "id": backend["id"],
+                    "address": backend["address"],
+                    "port": backend["port"],
+                }
+                return {
+                    "policy": "weighted_round_robin",
+                    "cursor": cursor,
+                    "candidates": candidates,
+                    "selected": selected,
+                    "outcome": "selected",
+                    "reason": "weighted_round_robin",
+                    "next_cursor": position,
+                }
+            index += 1
+            if index == size:
+                index = 0
+                position = 0
+            else:
+                position = offsets[index]
+        return {
+            "policy": "weighted_round_robin",
+            "cursor": cursor,
+            "candidates": candidates,
+            "selected": None,
+            "outcome": "failed",
+            "reason": "no_healthy_backend",
+            "next_cursor": cursor,
+        }
 
 
 class LeastConnectionsScheduler:
