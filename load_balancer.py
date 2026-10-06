@@ -22,7 +22,11 @@
   按会话键对当前健康后端评分（SHA-256 摘要取无符号大端整数，分数最大者
   胜出），不维护游标、连接计数或按键增长的缓存，单次选择最坏 O(n) 时间、
   额外空间 O(1)。
-* ``ConnectionStateError``：释放使活动连接数低于零时抛出。
+* ``ConnectionStateError``：连接计数或连接生命周期状态非法时抛出。
+* ``ConnectionTable(pool, idle_timeout, hard_timeout)``：以五元组标识
+  连接并绑定后端池中后端的连接生命周期表。时间只由显式注入的 ``now``
+  驱动；按五元组定位、记录活动和关闭平均 O(1)，``advance`` 与完整查询
+  O(n)，空间 O(n)。
 """
 
 import argparse
@@ -40,6 +44,7 @@ __all__ = [
     "WeightedRoundRobinScheduler",
     "LeastConnectionsScheduler",
     "ConsistentHashScheduler",
+    "ConnectionTable",
 ]
 
 _POLICY = "round_robin"
@@ -65,7 +70,7 @@ class NoAvailableBackendError(Exception):
 
 
 class ConnectionStateError(Exception):
-    """连接计数状态非法：释放会使活动连接数低于零。"""
+    """连接状态非法：计数会低于零、连接非 active 或时间发生回退。"""
 
 
 def _validate_configs(configs):
@@ -419,6 +424,266 @@ class ConsistentHashScheduler:
             "address": backend["address"],
             "port": backend["port"],
         }
+
+
+_FLOW_FIELDS = ("src_addr", "src_port", "dst_addr", "dst_port", "protocol")
+_PROTOCOLS = ("tcp", "udp")
+
+
+def _validate_flow(flow):
+    """校验五元组并返回规范化后的元组键。
+
+    flow 必须是恰好包含 src_addr、src_port、dst_addr、dst_port、protocol
+    五个字段的字典；类型错误抛出 TypeError，值错误（含布尔端口）抛出
+    ValueError，两种失败都不产生任何状态变化。
+    """
+    if not isinstance(flow, dict):
+        raise TypeError("flow must be a dict of five-tuple fields")
+    for key in flow:
+        if key not in _FLOW_FIELDS:
+            raise ValueError(f"flow: unknown field {key!r}")
+    for key in _FLOW_FIELDS:
+        if key not in flow:
+            raise ValueError(f"flow: missing field {key!r}")
+
+    for name in ("src_addr", "dst_addr"):
+        address = flow[name]
+        if not isinstance(address, str):
+            raise TypeError(f"flow {name} must be a string")
+        if address == "":
+            raise ValueError(f"flow {name} must be a non-empty string")
+
+    for name in ("src_port", "dst_port"):
+        port = flow[name]
+        # bool 是 int 的子类，端口必须显式排除布尔值。
+        if isinstance(port, bool):
+            raise ValueError(
+                f"flow {name} must be an integer between 1 and 65535"
+            )
+        if not isinstance(port, int):
+            raise TypeError(
+                f"flow {name} must be an integer between 1 and 65535"
+            )
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                f"flow {name} must be an integer between 1 and 65535"
+            )
+
+    protocol = flow["protocol"]
+    if not isinstance(protocol, str):
+        raise TypeError("flow protocol must be a string")
+    if protocol not in _PROTOCOLS:
+        raise ValueError("flow protocol must be 'tcp' or 'udp'")
+
+    return (
+        flow["src_addr"],
+        flow["src_port"],
+        flow["dst_addr"],
+        flow["dst_port"],
+        protocol,
+    )
+
+
+class ConnectionTable:
+    """连接生命周期表：以五元组标识连接并绑定后端池中的后端。
+
+    时间只由显式注入的 now 驱动（非布尔的非负整数，且不得回退，回退抛出
+    ConnectionStateError），不读取墙上时钟。idle_timeout 与 hard_timeout
+    必须为正整数，否则抛出 ConfigurationError。
+
+    open_connection 创建 active 记录，后端须存在（否则 KeyError）且健康
+    （否则 ConnectionStateError）；同一五元组已 active 时，相同后端返回
+    原记录，不同后端抛出 ConnectionStateError。record_activity 只更新
+    active 连接的最后活动时间，close_connection 把 active 连接置为
+    closed 且重复关闭幂等；对非 active 连接记录活动抛出
+    ConnectionStateError。每个操作先按 now 处理目标连接的到期再执行：
+    空闲或硬期限不晚于 now 时 active 连接转为 expired（同时命中时
+    end_reason 为 hard_timeout），截止时刻的活动不能挽救连接。单连接
+    操作只惰性处理目标五元组的到期（平均 O(1)）；advance 做全量扫描
+    （O(n)）并按建立顺序返回本次到期的记录。查询按建立顺序返回与内部
+    状态隔离的副本，记录键序固定为 flow、backend_id、state、
+    created_at、last_activity_at、ended_at、end_reason，flow 保持
+    五元组顺序。空间 O(n)。
+    """
+
+    def __init__(self, pool, idle_timeout, hard_timeout):
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        for name, value in (
+            ("idle_timeout", idle_timeout),
+            ("hard_timeout", hard_timeout),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ConfigurationError(
+                    f"{name} must be a positive integer"
+                )
+        self._pool = pool
+        self._idle_timeout = idle_timeout
+        self._hard_timeout = hard_timeout
+        # 五元组键 -> 记录；字典插入顺序即建立顺序，重新建立时先删后插。
+        self._records = {}
+        self._last_now = None
+
+    def _checked_now(self, now):
+        """校验 now 的类型、值与单调性；失败时不产生任何状态变化。"""
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be a non-negative integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        if self._last_now is not None and now < self._last_now:
+            raise ConnectionStateError("now must not move backwards")
+        return now
+
+    def _expire_if_due(self, record, now):
+        """若 active 记录在 now 前已到期则置为 expired，返回是否本次到期。"""
+        if record["state"] != "active":
+            return False
+        if record["created_at"] + self._hard_timeout <= now:
+            reason = "hard_timeout"
+        elif record["last_activity_at"] + self._idle_timeout <= now:
+            reason = "idle_timeout"
+        else:
+            return False
+        record["state"] = "expired"
+        record["ended_at"] = now
+        record["end_reason"] = reason
+        return True
+
+    @staticmethod
+    def _copy(record):
+        """返回与内部状态隔离、键序固定的记录副本。"""
+        return {
+            "flow": dict(record["flow"]),
+            "backend_id": record["backend_id"],
+            "state": record["state"],
+            "created_at": record["created_at"],
+            "last_activity_at": record["last_activity_at"],
+            "ended_at": record["ended_at"],
+            "end_reason": record["end_reason"],
+        }
+
+    def open_connection(self, flow, backend_id, now):
+        """按五元组建立 active 连接并返回记录副本。
+
+        后端不存在抛出 KeyError，不健康抛出 ConnectionStateError；同一
+        五元组已 active 时，相同后端返回原记录，不同后端抛出
+        ConnectionStateError；已 closed 或 expired 的五元组重新建立新
+        记录并排到建立顺序末尾。参数校验失败不产生任何状态变化。
+        """
+        now = self._checked_now(now)
+        key = _validate_flow(flow)
+        if not isinstance(backend_id, str):
+            raise TypeError("backend id must be a string")
+        index = self._pool._index.get(backend_id)
+        if index is None:
+            raise KeyError(backend_id)
+        if not self._pool._backends[index]["healthy"]:
+            raise ConnectionStateError(
+                f"backend {backend_id!r} is not healthy"
+            )
+        self._last_now = now
+        record = self._records.get(key)
+        if record is not None:
+            self._expire_if_due(record, now)
+            if record["state"] == "active":
+                if record["backend_id"] == backend_id:
+                    return self._copy(record)
+                raise ConnectionStateError(
+                    "flow already has an active connection on backend "
+                    f"{record['backend_id']!r}"
+                )
+            # 已结束的记录被新记录替换，并移到建立顺序末尾。
+            del self._records[key]
+        record = {
+            "flow": {
+                "src_addr": key[0],
+                "src_port": key[1],
+                "dst_addr": key[2],
+                "dst_port": key[3],
+                "protocol": key[4],
+            },
+            "backend_id": backend_id,
+            "state": "active",
+            "created_at": now,
+            "last_activity_at": now,
+            "ended_at": None,
+            "end_reason": None,
+        }
+        self._records[key] = record
+        return self._copy(record)
+
+    def record_activity(self, flow, now):
+        """把 active 连接的最后活动时间更新为 now 并返回记录副本。
+
+        连接不存在或已非 active 时抛出 ConnectionStateError；截止时刻
+        的活动不能挽救连接（先按 now 处理到期再执行）。
+        """
+        now = self._checked_now(now)
+        key = _validate_flow(flow)
+        self._last_now = now
+        record = self._records.get(key)
+        if record is None:
+            raise ConnectionStateError("no connection for this flow")
+        self._expire_if_due(record, now)
+        if record["state"] != "active":
+            raise ConnectionStateError(
+                f"connection is {record['state']}, not active"
+            )
+        record["last_activity_at"] = now
+        return self._copy(record)
+
+    def close_connection(self, flow, now):
+        """把 active 连接置为 closed 并返回记录副本。
+
+        重复关闭幂等，返回既有 closed 记录且不改变任何状态；连接不存在
+        或已 expired 时抛出 ConnectionStateError。
+        """
+        now = self._checked_now(now)
+        key = _validate_flow(flow)
+        self._last_now = now
+        record = self._records.get(key)
+        if record is None:
+            raise ConnectionStateError("no connection for this flow")
+        self._expire_if_due(record, now)
+        if record["state"] == "closed":
+            return self._copy(record)
+        if record["state"] != "active":
+            raise ConnectionStateError(
+                f"connection is {record['state']}, not active"
+            )
+        record["state"] = "closed"
+        record["ended_at"] = now
+        record["end_reason"] = "closed"
+        return self._copy(record)
+
+    def advance(self, now):
+        """按 now 处理全部连接的到期，返回本次到期的记录副本列表。
+
+        结果按建立顺序排列；已被此前操作惰性到期的记录不会重复出现。
+        """
+        now = self._checked_now(now)
+        self._last_now = now
+        expired = []
+        for record in self._records.values():
+            if self._expire_if_due(record, now):
+                expired.append(self._copy(record))
+        return expired
+
+    def connections(self):
+        """返回全部记录的隔离副本列表，按建立顺序排列。"""
+        return [self._copy(record) for record in self._records.values()]
+
+    def active_connections(self):
+        """返回每个后端的 active 连接数，键按后端声明顺序排列。"""
+        counts = {backend["id"]: 0 for backend in self._pool._backends}
+        for record in self._records.values():
+            if record["state"] == "active":
+                counts[record["backend_id"]] += 1
+        return counts
 
 
 def _positive_int(value):
