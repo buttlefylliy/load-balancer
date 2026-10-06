@@ -24,7 +24,9 @@
 * ``ConsistentHashScheduler(pool)``：一致性哈希调度器，``select(key)``
   按会话键对当前健康后端评分（SHA-256 摘要取无符号大端整数，分数最大者
   胜出），不维护游标、连接计数或按键增长的缓存，单次选择最坏 O(n) 时间、
-  额外空间 O(1)。
+  额外空间 O(1)；``explain(key)`` 返回该次选择键序固定的可重放解释
+  （全部候选与分数、selected、outcome、reason），与 select 同校验但
+  无健康后端时不抛错，单次查询 O(n) 时间、除返回结果外额外空间 O(1)。
 * ``ConnectionTable(pool, idle_timeout, hard_timeout)``：以五元组标识连接、
   绑定后端池的连接生命周期表。时间只由显式 ``now`` 驱动；按五元组定位、
   记录活动与关闭平均 O(1) 时间，``advance`` 与完整查询 O(n) 时间，
@@ -428,6 +430,10 @@ class ConsistentHashScheduler:
     映射；恢复健康后按同一评分规则确定性地回到原选择。健康变化在下一次
     select 立即生效，选择过程不改写池或本调度器的任何状态。没有健康后端
     时抛出 NoAvailableBackendError。
+
+    ``explain(key)`` 复用同一校验与评分规则，但不抛出
+    NoAvailableBackendError：返回包含全部候选及其分数、选中结果与失败
+    原因的可重放解释字典，同样不修改任何状态，也不维护按键累计的状态。
     """
 
     def __init__(self, pool):
@@ -475,6 +481,84 @@ class ConsistentHashScheduler:
             "id": backend["id"],
             "address": backend["address"],
             "port": backend["port"],
+        }
+
+    def explain(self, key):
+        """返回一次一致性哈希选择的可重放解释，不改变任何状态。
+
+        与 select 采用相同的 key 类型与值校验：非字符串抛出 TypeError，
+        空字符串抛出 ValueError，校验失败不改变池或调度器状态。结果是
+        键序固定为 policy、key、candidates、selected、outcome、reason 的
+        新字典：policy 固定为 consistent_hash；candidates 按后端声明顺序
+        排列，每项键序固定为 backend_id、healthy、score，健康后端的 score
+        为 SHA-256 摘要保留前导零的 64 位小写十六进制字符串，不健康后端
+        不参与比较且 score 为 None。存在健康后端时 selected 是键序固定为
+        id、address、port 的新字典（池状态不变时与 select 对同一 key 的
+        返回逐字段一致），outcome 为 selected，reason 为 highest_score，
+        最高分相同时取声明顺序最前的健康后端；没有健康后端时不抛出
+        NoAvailableBackendError，selected 为 None、outcome 为 failed、
+        reason 为 no_healthy_backend。单次查询 O(n) 时间，除返回的 O(n)
+        解释结果外只使用 O(1) 额外空间。
+        """
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        if key == "":
+            raise ValueError("key must be a non-empty string")
+        backends = self._pool._backends
+        candidates = []
+        chosen = -1
+        best_score = -1
+        for index, backend in enumerate(backends):
+            healthy = backend["healthy"]
+            if not healthy:
+                candidates.append(
+                    {
+                        "backend_id": backend["id"],
+                        "healthy": healthy,
+                        "score": None,
+                    }
+                )
+                continue
+            # 评分与 select 完全一致：仅键与后端 id 参与评分，摘要按
+            # 无符号大端整数比较；十六进制形态保留前导零共 64 个字符。
+            payload = json.dumps(
+                [key, backend["id"]],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            digest = hashlib.sha256(payload).digest()
+            score = int.from_bytes(digest, "big", signed=False)
+            candidates.append(
+                {
+                    "backend_id": backend["id"],
+                    "healthy": healthy,
+                    "score": digest.hex(),
+                }
+            )
+            # 只在严格更大时替换，摘要相同保留声明顺序最前者。
+            if score > best_score:
+                best_score = score
+                chosen = index
+        if chosen < 0:
+            selected = None
+            outcome = "failed"
+            reason = "no_healthy_backend"
+        else:
+            backend = backends[chosen]
+            selected = {
+                "id": backend["id"],
+                "address": backend["address"],
+                "port": backend["port"],
+            }
+            outcome = "selected"
+            reason = "highest_score"
+        return {
+            "policy": "consistent_hash",
+            "key": key,
+            "candidates": candidates,
+            "selected": selected,
+            "outcome": outcome,
+            "reason": reason,
         }
 
 
