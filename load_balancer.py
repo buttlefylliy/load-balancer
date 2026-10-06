@@ -14,7 +14,10 @@
 * ``BackendPool.set_healthy(backend_id, healthy)``：按 id 原子更新健康标记。
 * ``RoundRobinScheduler(pool)``：绑定后端池的轮询调度器。
 * ``RoundRobinScheduler.select()``：返回下一个健康后端，最坏 O(n) 时间、
-  额外空间 O(1)。
+  额外空间 O(1)；``explain()`` 返回键序固定的可重放解释（调用前游标、
+  全部候选的声明位置、selected、outcome、reason、next_cursor），与
+  select 同规则但无健康后端时不抛错，不推进游标或改变任何状态，
+  单次查询 O(n) 时间、除返回结果外额外空间 O(1)。
 * ``WeightedRoundRobinScheduler(pool)``：按 weight 构造逻辑循环的加权轮询
   调度器，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间 O(1)；
   ``explain()`` 返回键序固定的可重放解释（调用前游标、全部候选的权重
@@ -273,6 +276,12 @@ class RoundRobinScheduler:
     游标指向上一次成功选择的位置，初始位于首项之前（-1）。每次选择
     从游标后继位置开始做至多 n 次检查的有界扫描，跳过不健康后端；
     找不到健康后端时抛出 NoAvailableBackendError 且保持游标不变。
+
+    ``explain()`` 复用与 select 完全相同的起点定位、跳过与回绕规则，
+    但不抛出调度异常、不推进游标：返回包含调用前游标、全部候选的
+    声明位置与选中结果的可重放解释字典，健康变化立即体现在下一次
+    解释中；池状态不变时，解释与紧随其后的 select 选中同一后端，
+    且 next_cursor 即该次 select 将写入的位置。
     """
 
     def __init__(self, pool):
@@ -301,6 +310,66 @@ class RoundRobinScheduler:
                     "port": backend["port"],
                 }
         raise NoAvailableBackendError("no healthy backend available")
+
+    def explain(self):
+        """返回一次普通轮询选择的可重放解释，不推进游标或改变任何状态。
+
+        结果是键序固定为 policy、cursor、candidates、selected、outcome、
+        reason、next_cursor 的新字典：policy 固定为 round_robin；cursor
+        为调用前的游标（上一次成功选择的位置，初始为 -1）；candidates
+        按后端声明顺序排列，每项键序固定为 backend_id、healthy、
+        position，position 是从零开始且稳定不变的声明位置。解释从
+        cursor 的后继位置开始并在末尾回绕，按 select 的现有规则跳过
+        不健康后端：存在健康后端时 selected 是键序固定为 id、address、
+        port 的新字典，outcome 为 selected，reason 为 round_robin，
+        next_cursor 为预计选中的位置；池状态不变时紧随其后的 select
+        返回同一后端并把游标推进到 next_cursor。空池或全部后端均不
+        健康时不抛出 NoAvailableBackendError：返回全部候选，selected
+        为 None、outcome 为 failed、reason 为 no_healthy_backend、
+        next_cursor 等于 cursor；同一情形下 select 仍抛出
+        NoAvailableBackendError。解释不修改游标、池或健康标记，修改
+        返回对象不污染后续结果；池状态不变时重复调用逐字段一致，
+        set_healthy 的变化立即反映在下一次解释中。单次查询 O(n)
+        时间，除返回的 O(n) 解释结果外只使用 O(1) 额外空间。
+        """
+        backends = self._pool._backends
+        size = len(backends)
+        cursor = self._cursor
+        candidates = [
+            {
+                "backend_id": backend["id"],
+                "healthy": backend["healthy"],
+                "position": index,
+            }
+            for index, backend in enumerate(backends)
+        ]
+        # 起点定位、跳过与回绕与 select 完全一致，只是不写回游标。
+        for offset in range(size):
+            index = (cursor + 1 + offset) % size
+            backend = backends[index]
+            if backend["healthy"]:
+                return {
+                    "policy": "round_robin",
+                    "cursor": cursor,
+                    "candidates": candidates,
+                    "selected": {
+                        "id": backend["id"],
+                        "address": backend["address"],
+                        "port": backend["port"],
+                    },
+                    "outcome": "selected",
+                    "reason": "round_robin",
+                    "next_cursor": index,
+                }
+        return {
+            "policy": "round_robin",
+            "cursor": cursor,
+            "candidates": candidates,
+            "selected": None,
+            "outcome": "failed",
+            "reason": "no_healthy_backend",
+            "next_cursor": cursor,
+        }
 
 
 class WeightedRoundRobinScheduler:
