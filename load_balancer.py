@@ -60,7 +60,10 @@
 * ``HealthCheckTracker(pool, failure_threshold, recovery_threshold)``：
   只消费显式检查结果的健康跟踪器，按连续失败/成功次数在共享池中自动
   摘除与回切后端；不发起网络请求、不读取墙上时钟。单次记录平均 O(1)
-  时间，完整查询 O(n) 时间，空间 O(n)。
+  时间，完整查询 O(n) 时间，空间 O(n)；``explain(backend_id, success,
+  now)`` 复用 record_result 的校验与判定顺序，返回键序固定的预览
+  （保持、摘除或回切及原因），不修改任何状态，单次查询 O(1) 时间、
+  O(1) 额外空间。
 """
 
 import argparse
@@ -1518,6 +1521,13 @@ class HealthCheckTracker:
     set_healthy 改变状态后，下一次记录以池中实际状态为准并重置该
     后端的连续计数。
 
+    ``explain(backend_id, success, now)`` 复用 record_result 的校验与
+    判定顺序，预览下一次检查会保持、摘除或回切后端，但不修改时间、
+    计数、最近结果或池：返回键序固定为 backend_id、success、
+    checked_at、healthy、changed、consecutive_failures、
+    consecutive_successes、reason 的新字典，单次查询 O(1) 时间、
+    O(1) 额外空间。
+
     单次记录平均 O(1) 时间，statuses 完整查询 O(n) 时间，空间 O(n)。
     """
 
@@ -1637,6 +1647,103 @@ class HealthCheckTracker:
         state["last_result"] = result
         self._now = now
         return dict(result)
+
+    def explain(self, backend_id, success, now):
+        """预览下一次检查的结果，不修改时间、计数、最近结果或池。
+
+        与 record_result 采用完全相同的校验与判定顺序：backend_id 非
+        字符串、success 非布尔或 now 类型错误抛出 TypeError，负 now
+        抛出 ValueError，未知 id 抛出 KeyError，全局时间回退或同一
+        后端同一 now 的冲突结果抛出 ConnectionStateError；任何失败都
+        不改变状态。结果是键序固定为 backend_id、success、checked_at、
+        healthy、changed、consecutive_failures、consecutive_successes、
+        reason 的独立新字典，调用方可自由修改而不影响后续行为。
+
+        普通事件的 healthy、changed、连续计数与 checked_at 与当前状态
+        下随后记录同一事件的对应字段一致：达到失败或恢复阈值时 reason
+        为 failure_threshold_reached 或 recovery_threshold_reached，
+        其余为 success_recorded 或 failure_recorded。外部 set_healthy
+        改写健康标记后，按真实记录规则以池中状态重置该后端计数再预测。
+        同一后端同一 now 重复相同 success 时 reason 为 idempotent_repeat，
+        其余字段预测原幂等结果。状态不变时重复解释一致，解释后立即记录
+        同一事件也得到一致字段。单次查询 O(1) 时间、O(1) 额外空间。
+        """
+        if not isinstance(backend_id, str):
+            raise TypeError("backend id must be a string")
+        if not isinstance(success, bool):
+            raise TypeError("success must be a boolean")
+        # bool 是 int 的子类，时间戳必须显式排除布尔值。
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be an integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        index = self._pool._index.get(backend_id)
+        if index is None:
+            raise KeyError(backend_id)
+        if self._now is not None and now < self._now:
+            raise ConnectionStateError("now must not move backwards")
+
+        state = self._states[index]
+        if state["last_now"] is not None and now == state["last_now"]:
+            if success != state["last_success"]:
+                raise ConnectionStateError(
+                    f"conflicting result for backend {backend_id!r} "
+                    f"at now={now}"
+                )
+            last = state["last_result"]
+            return {
+                "backend_id": backend_id,
+                "success": success,
+                "checked_at": last["checked_at"],
+                "healthy": last["healthy"],
+                "changed": last["changed"],
+                "consecutive_failures": last["consecutive_failures"],
+                "consecutive_successes": last["consecutive_successes"],
+                "reason": "idempotent_repeat",
+            }
+
+        # 与 record_result 相同的判定，但只在局部副本上推演：
+        # 外部 set_healthy 造成的偏移以池中实际状态为准并重置计数。
+        actual = self._pool._backends[index]["healthy"]
+        if actual != state["known_healthy"]:
+            known = actual
+            failures = 0
+            successes = 0
+        else:
+            known = state["known_healthy"]
+            failures = state["consecutive_failures"]
+            successes = state["consecutive_successes"]
+
+        if success:
+            successes += 1
+            failures = 0
+        else:
+            failures += 1
+            successes = 0
+
+        changed = False
+        if actual and failures >= self._failure_threshold:
+            healthy = False
+            changed = True
+            reason = "failure_threshold_reached"
+        elif not actual and successes >= self._recovery_threshold:
+            healthy = True
+            changed = True
+            reason = "recovery_threshold_reached"
+        else:
+            healthy = known
+            reason = "success_recorded" if success else "failure_recorded"
+
+        return {
+            "backend_id": backend_id,
+            "success": success,
+            "checked_at": now,
+            "healthy": healthy,
+            "changed": changed,
+            "consecutive_failures": failures,
+            "consecutive_successes": successes,
+            "reason": reason,
+        }
 
     def statuses(self):
         """按后端声明顺序返回全部后端的状态（新字典组成的新列表）。
