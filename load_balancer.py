@@ -15,6 +15,10 @@
   额外空间 O(1)。
 * ``WeightedRoundRobinScheduler(pool)``：按 weight 构造逻辑循环的加权轮询
   调度器，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间 O(1)。
+* ``LeastConnectionsScheduler(pool)``：最少连接调度器，为每个后端维护
+  从零开始的活动连接数，额外空间 O(n)，单次选择最坏 O(n) 时间、
+  额外空间 O(1)，单次释放 O(1)。
+* ``ConnectionStateError``：释放使活动连接数低于零时抛出。
 """
 
 import argparse
@@ -25,20 +29,24 @@ import sys
 __all__ = [
     "ConfigurationError",
     "NoAvailableBackendError",
+    "ConnectionStateError",
     "BackendPool",
     "RoundRobinScheduler",
     "WeightedRoundRobinScheduler",
+    "LeastConnectionsScheduler",
 ]
 
 _POLICY = "round_robin"
 _WEIGHTED_POLICY = "weighted_round_robin"
+_LEAST_POLICY = "least_connections"
 _FIELDS = ("id", "address", "port", "healthy")
 _OPTIONAL_FIELDS = ("weight",)
 _KNOWN_FIELDS = _FIELDS + _OPTIONAL_FIELDS
 _COMPLEXITY = (
     "复杂度：建池为 O(n) 时间与 O(n) 空间；"
     "单次选择最坏 O(n) 时间且额外空间 O(1)；"
-    "加权调度器额外保存 O(n) 的前缀和。"
+    "加权调度器额外保存 O(n) 的前缀和；"
+    "最少连接调度器额外保存 O(n) 的活动连接计数，单次释放 O(1)。"
 )
 
 
@@ -48,6 +56,10 @@ class ConfigurationError(ValueError):
 
 class NoAvailableBackendError(Exception):
     """一次有界扫描内没有找到任何健康后端。"""
+
+
+class ConnectionStateError(Exception):
+    """连接计数状态非法：释放会使活动连接数低于零。"""
 
 
 def _validate_configs(configs):
@@ -268,6 +280,78 @@ class WeightedRoundRobinScheduler:
         raise NoAvailableBackendError("no healthy backend available")
 
 
+class LeastConnectionsScheduler:
+    """最少连接调度器。
+
+    按声明顺序为每个后端维护一个从零开始的活动连接数（O(n) 空间，
+    不展开保存重复项）。每次选择只考察当前健康的后端，取活动连接数
+    最小者，计数相同时取声明顺序最前者；选定后先把该后端的计数加一，
+    再返回结果。健康标记的变更立即影响后续选择，但不清除或改写已有
+    计数；不健康的后端仍允许释放既有连接，恢复健康后以保留的计数
+    继续参与比较。没有健康后端时抛出 NoAvailableBackendError，
+    所有计数与选择状态均不改变。
+    """
+
+    def __init__(self, pool):
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        self._pool = pool
+        self._counts = [0] * len(pool._backends)
+
+    def select(self):
+        """选择当前健康且活动连接数最小的后端。
+
+        结果是键序固定为 id、address、port 的新字典；成功后被选后端的
+        活动连接数先加一再返回。没有健康后端时抛出
+        NoAvailableBackendError，所有计数均不改变。
+        """
+        backends = self._pool._backends
+        counts = self._counts
+        chosen = -1
+        for index, backend in enumerate(backends):
+            if backend["healthy"] and (
+                chosen < 0 or counts[index] < counts[chosen]
+            ):
+                chosen = index
+        if chosen < 0:
+            raise NoAvailableBackendError("no healthy backend available")
+        counts[chosen] += 1
+        backend = backends[chosen]
+        return {
+            "id": backend["id"],
+            "address": backend["address"],
+            "port": backend["port"],
+        }
+
+    def release_connection(self, backend_id):
+        """按 id 释放一个活动连接，对应计数减一。
+
+        不健康的后端同样允许释放。id 不是字符串时抛出 TypeError，
+        id 不存在时抛出 KeyError；计数已为零时抛出
+        ConnectionStateError，且任何计数都不改变。
+        """
+        if not isinstance(backend_id, str):
+            raise TypeError("backend id must be a string")
+        index = self._pool._index.get(backend_id)
+        if index is None:
+            raise KeyError(backend_id)
+        if self._counts[index] == 0:
+            raise ConnectionStateError(
+                f"backend {backend_id!r} has no active connection to release"
+            )
+        self._counts[index] -= 1
+
+    def active_connections(self):
+        """返回全部后端的活动连接数。
+
+        结果是与内部状态隔离的新字典，键按声明顺序排列，值为非负整数。
+        """
+        return {
+            backend["id"]: self._counts[index]
+            for index, backend in enumerate(self._pool._backends)
+        }
+
+
 def _positive_int(value):
     try:
         number = int(value)
@@ -330,7 +414,7 @@ def _build_parser():
     )
     schedule.add_argument(
         "--policy",
-        choices=(_POLICY, _WEIGHTED_POLICY),
+        choices=(_POLICY, _WEIGHTED_POLICY, _LEAST_POLICY),
         default=_POLICY,
         help="调度策略，省略时为 round_robin",
     )
@@ -369,6 +453,8 @@ def _handle_schedule(args):
 
     if args.policy == _WEIGHTED_POLICY:
         scheduler = WeightedRoundRobinScheduler(pool)
+    elif args.policy == _LEAST_POLICY:
+        scheduler = LeastConnectionsScheduler(pool)
     else:
         scheduler = RoundRobinScheduler(pool)
     selections = []
