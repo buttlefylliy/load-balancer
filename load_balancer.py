@@ -20,7 +20,10 @@
 * ``LeastConnectionsScheduler(pool)``：最少连接调度器，为每个后端维护
   从零开始的活动连接数，只在健康且未达 max_connections 上限的后端中
   取计数最小者，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间
-  O(1)，单次释放 O(1)。
+  O(1)，单次释放 O(1)；``explain()`` 返回键序固定的可重放解释
+  （全部候选的连接数、容量与 eligible、selected、outcome、reason），
+  与 select 同规则但没有健康后端或全部已满时不抛错，不改变任何状态，
+  单次查询 O(n) 时间、除返回结果外额外空间 O(1)。
 * ``ConsistentHashScheduler(pool)``：一致性哈希调度器，``select(key)``
   按会话键对当前健康后端评分（SHA-256 摘要取无符号大端整数，分数最大者
   胜出），不维护游标、连接计数或按键增长的缓存，单次选择最坏 O(n) 时间、
@@ -352,6 +355,11 @@ class LeastConnectionsScheduler:
     后以保留的计数与上限重新参与比较。没有健康后端时抛出
     NoAvailableBackendError；存在健康后端但全部达到上限时抛出
     BackendOverloadedError，两种失败均不改变任何计数。
+
+    ``explain()`` 复用与 select 完全相同的筛选与决胜规则，但不抛出
+    调度异常、不增加任何计数：返回包含全部候选的连接数、容量与
+    eligible 标记、选中结果与失败原因的可重放解释字典，健康变化与
+    release_connection 的结果立即体现在下一次解释中。
     """
 
     def __init__(self, pool):
@@ -422,6 +430,79 @@ class LeastConnectionsScheduler:
         return {
             backend["id"]: self._counts[index]
             for index, backend in enumerate(self._pool._backends)
+        }
+
+    def explain(self):
+        """返回一次最少连接选择的可重放解释，不改变任何状态。
+
+        结果是键序固定为 policy、candidates、selected、outcome、reason
+        的新字典：policy 固定为 least_connections；candidates 按后端
+        声明顺序排列，每项键序固定为 backend_id、healthy、
+        active_connections、max_connections、eligible，未配置容量上限时
+        max_connections 为 None，eligible 仅在后端健康且活动连接数低于
+        自身上限时为 True（省略上限的健康后端恒为 eligible）。解释采用
+        与紧随其后的 select 完全相同的规则：在 eligible 候选中取活动
+        连接数最小者，计数相同取声明顺序最前者。可以调度时 selected 是
+        键序固定为 id、address、port 的新字典，outcome 为 selected，
+        reason 为 least_connections；没有健康后端时 selected 为 None、
+        outcome 为 failed、reason 为 no_healthy_backend；存在健康后端但
+        全部已满时 selected 为 None、outcome 为 failed、reason 为
+        all_healthy_backends_at_capacity，两种失败都不抛出调度异常。
+        解释不增加计数、不改变池状态或后续选择；池状态不变时重复调用
+        返回逐字段一致的结果，修改返回值不污染内部状态。单次查询 O(n)
+        时间，除返回的 O(n) 解释结果外只使用 O(1) 额外空间。
+        """
+        backends = self._pool._backends
+        counts = self._counts
+        candidates = []
+        chosen = -1
+        saw_healthy = False
+        for index, backend in enumerate(backends):
+            healthy = backend["healthy"]
+            limit = backend["max_connections"]
+            # eligible 与 select 的筛选条件严格一致：健康且计数低于上限，
+            # 省略上限（None）时容量筛选始终通过。
+            eligible = healthy and (
+                limit is None or counts[index] < limit
+            )
+            candidates.append(
+                {
+                    "backend_id": backend["id"],
+                    "healthy": healthy,
+                    "active_connections": counts[index],
+                    "max_connections": limit,
+                    "eligible": eligible,
+                }
+            )
+            if not healthy:
+                continue
+            saw_healthy = True
+            if limit is not None and counts[index] >= limit:
+                continue
+            if chosen < 0 or counts[index] < counts[chosen]:
+                chosen = index
+        if chosen < 0:
+            selected = None
+            outcome = "failed"
+            if not saw_healthy:
+                reason = "no_healthy_backend"
+            else:
+                reason = "all_healthy_backends_at_capacity"
+        else:
+            backend = backends[chosen]
+            selected = {
+                "id": backend["id"],
+                "address": backend["address"],
+                "port": backend["port"],
+            }
+            outcome = "selected"
+            reason = "least_connections"
+        return {
+            "policy": "least_connections",
+            "candidates": candidates,
+            "selected": selected,
+            "outcome": outcome,
+            "reason": reason,
         }
 
 
