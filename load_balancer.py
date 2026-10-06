@@ -31,6 +31,11 @@
   空间 O(n)。
 * ``ConnectionStateError``：连接状态非法时抛出（释放使活动连接数低于零、
   对非 active 连接记录活动、五元组冲突、now 回退等）。
+* ``HealthCheckTracker(pool, failure_threshold, recovery_threshold)``：
+  绑定后端池的健康检查跟踪器。只消费显式提交的检查结果，不发起网络
+  请求、不读取墙上时钟；连续失败达到 failure_threshold 时立即在共享池中
+  把后端标为不健康，连续成功达到 recovery_threshold 时立即恢复健康。
+  单次记录平均 O(1) 时间，完整状态查询 O(n) 时间，空间 O(n)。
 """
 
 import argparse
@@ -51,6 +56,7 @@ __all__ = [
     "LeastConnectionsScheduler",
     "ConsistentHashScheduler",
     "ConnectionTable",
+    "HealthCheckTracker",
 ]
 
 _POLICY = "round_robin"
@@ -749,6 +755,164 @@ class ConnectionTable:
             backend["id"]: self._active_counts[backend["id"]]
             for backend in self._pool._backends
         }
+
+
+class HealthCheckTracker:
+    """绑定 BackendPool 的健康检查跟踪器。
+
+    只消费显式提交的检查结果：不发起网络请求、不读取墙上时钟，时间只由
+    ``record_result`` 的 ``now`` 参数驱动，``now`` 必须是非布尔的非负
+    整数且单调不减。两个阈值必须是非布尔的正整数。
+
+    健康后端的失败累计连续失败并清零连续成功，连续失败达到
+    failure_threshold 时立即在共享池中标为不健康；成功清零连续失败。
+    不健康后端的成功累计连续成功并清零连续失败，连续成功达到
+    recovery_threshold 时立即恢复健康；失败清零连续成功。状态变化通过
+    共享池立即对绑定同一池的调度器生效，但不重置调度器游标、连接记录
+    或最少连接计数。外部 set_healthy 改变状态后，下一次记录以池中实际
+    状态为准并重置该后端的连续计数。
+
+    单次记录平均 O(1) 时间，statuses 完整查询 O(n) 时间，空间 O(n)。
+    """
+
+    def __init__(self, pool, failure_threshold, recovery_threshold):
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        for name, value in (
+            ("failure_threshold", failure_threshold),
+            ("recovery_threshold", recovery_threshold),
+        ):
+            # bool 是 int 的子类，阈值必须显式排除布尔值。
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        self._pool = pool
+        self._failure_threshold = failure_threshold
+        self._recovery_threshold = recovery_threshold
+        self._now = None
+        # 每个后端一份跟踪状态，按 id 索引；known_healthy 是最近一次
+        # 记录时池中的实际状态，用于检测外部 set_healthy 造成的偏离。
+        self._states = {
+            backend["id"]: {
+                "known_healthy": backend["healthy"],
+                "consecutive_failures": 0,
+                "consecutive_successes": 0,
+                "changed": False,
+                "checked_at": None,
+                "last_success": None,
+                "last_result": None,
+            }
+            for backend in pool._backends
+        }
+
+    def record_result(self, backend_id, success, now):
+        """提交一次后端健康检查结果，返回本次记录的状态副本。
+
+        结果是键序固定为 backend_id、healthy、changed、
+        consecutive_failures、consecutive_successes、checked_at 的新
+        字典。同一后端在同一 now 最多有一个结果：相同的重复提交幂等地
+        返回上次结果的副本，success 冲突则抛出 ConnectionStateError。
+        backend_id 不是字符串、success 不是布尔值或 now 类型错误时抛出
+        TypeError；now 为负时抛出 ValueError；id 未知时抛出 KeyError；
+        now 回退时抛出 ConnectionStateError。任何失败都不改变计数、
+        时间或池状态。
+        """
+        if not isinstance(backend_id, str):
+            raise TypeError("backend id must be a string")
+        if not isinstance(success, bool):
+            raise TypeError("success must be a boolean")
+        # bool 是 int 的子类，时间戳必须显式排除布尔值。
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be an integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        index = self._pool._index.get(backend_id)
+        if index is None:
+            raise KeyError(backend_id)
+        if self._now is not None and now < self._now:
+            raise ConnectionStateError("now must not move backwards")
+
+        state = self._states[backend_id]
+        if state["checked_at"] == now:
+            if state["last_success"] == success:
+                # 同一后端同一时刻的相同重复提交：幂等重放上次结果。
+                return dict(state["last_result"])
+            raise ConnectionStateError(
+                f"backend {backend_id!r} already has a conflicting "
+                f"result at now={now}"
+            )
+
+        self._now = now
+        healthy = self._pool._backends[index]["healthy"]
+        if healthy != state["known_healthy"]:
+            # 外部 set_healthy 改变了状态：以池中实际状态为准并重置计数。
+            state["known_healthy"] = healthy
+            state["consecutive_failures"] = 0
+            state["consecutive_successes"] = 0
+
+        changed = False
+        if healthy:
+            if success:
+                state["consecutive_failures"] = 0
+            else:
+                state["consecutive_failures"] += 1
+                state["consecutive_successes"] = 0
+                if state["consecutive_failures"] >= self._failure_threshold:
+                    self._pool.set_healthy(backend_id, False)
+                    state["known_healthy"] = False
+                    state["consecutive_failures"] = 0
+                    state["consecutive_successes"] = 0
+                    changed = True
+        else:
+            if success:
+                state["consecutive_successes"] += 1
+                state["consecutive_failures"] = 0
+                if state["consecutive_successes"] >= self._recovery_threshold:
+                    self._pool.set_healthy(backend_id, True)
+                    state["known_healthy"] = True
+                    state["consecutive_failures"] = 0
+                    state["consecutive_successes"] = 0
+                    changed = True
+            else:
+                state["consecutive_successes"] = 0
+
+        state["changed"] = changed
+        state["checked_at"] = now
+        state["last_success"] = success
+        result = {
+            "backend_id": backend_id,
+            "healthy": self._pool._backends[index]["healthy"],
+            "changed": changed,
+            "consecutive_failures": state["consecutive_failures"],
+            "consecutive_successes": state["consecutive_successes"],
+            "checked_at": now,
+        }
+        state["last_result"] = result
+        return dict(result)
+
+    def statuses(self):
+        """按后端声明顺序返回全部后端的状态副本列表。
+
+        每项的键序与 record_result 的返回一致；healthy 反映池中当前的
+        实际状态。从未检查的后端 checked_at 为 None、changed 为 False、
+        连续计数为零。
+        """
+        result = []
+        for backend in self._pool._backends:
+            backend_id = backend["id"]
+            state = self._states[backend_id]
+            result.append(
+                {
+                    "backend_id": backend_id,
+                    "healthy": backend["healthy"],
+                    "changed": state["changed"],
+                    "consecutive_failures": state["consecutive_failures"],
+                    "consecutive_successes": state["consecutive_successes"],
+                    "checked_at": state["checked_at"],
+                }
+            )
+        return result
 
 
 def _positive_int(value):
