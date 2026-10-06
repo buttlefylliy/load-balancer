@@ -34,3 +34,13 @@
 * 库接口提供 `release_connection(backend_id)` 与 `active_connections()`：释放成功只把对应计数减一，重复释放到零以下抛出 `ConnectionStateError` 且任何计数不变；id 非字符串抛出 `TypeError`，id 不存在抛出 `KeyError`。查询返回与内部状态隔离、按声明顺序排列的新字典。
 * 健康状态变化立即影响后续选择，但不清除或改写已有计数；不健康的后端仍允许释放既有连接，恢复健康后以保留的计数继续参与比较。
 * 构造为 O(n) 时间与 O(n) 额外空间，单次选择最坏 O(n)、额外空间 O(1)，单次释放 O(1)，计数查询 O(n)。
+
+## 一致性哈希（库接口）
+
+`ConsistentHashScheduler(pool)` 可从 `load_balancer` 直接导入，构造时接收一个 `BackendPool`，通过 `select(key)` 按调用方给出的会话键选择后端；它不接入 `schedule` 命令，命令行语义保持不变。
+
+* 每次选择只比较当前健康后端：把由 key 与后端 id 组成的 JSON 数组（即 `[key, backend_id]`）按 `ensure_ascii=False` 与紧凑分隔符序列化为 UTF-8，再计算 SHA-256；摘要按无符号大端整数解释，分数最大的后端胜出，摘要相同时按配置声明顺序取最前者。`address`、`port`、`weight` 与声明位置均不参与评分，`weight` 仍由 `BackendPool` 按既有规则校验。
+* 调度器不维护轮询游标或连接计数：同一键在后端集合与健康状态不变时，无论调用次数及与其他键的调用顺序如何，都返回逐字段相同的新后端字典，字典键序固定为 id、address、port。
+* 某后端被标记为不健康后，原本未选择它的键保持原选择，原本选择它的键才在其余健康后端中重新映射；该后端恢复健康后，相同键按原评分规则重新选择，此前属于它的键确定性地回到它。健康变化在下一次 `select` 调用立即生效，选择过程不改写池或其他调度器状态。
+* key 必须是非空字符串：非字符串抛出 `TypeError`，空字符串抛出 `ValueError`，两种失败都不产生状态变化；没有健康后端时抛出 `NoAvailableBackendError`；构造参数不是 `BackendPool` 时抛出 `TypeError`。
+* 单次选择最坏 O(n) 时间，除摘要计算所需的固定大小数据外额外空间 O(1)，不建立按键增长的缓存。

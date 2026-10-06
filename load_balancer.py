@@ -18,11 +18,15 @@
 * ``LeastConnectionsScheduler(pool)``：最少连接调度器，为每个后端维护
   从零开始的活动连接数，额外空间 O(n)，单次选择最坏 O(n) 时间、
   额外空间 O(1)，单次释放 O(1)。
+* ``ConsistentHashScheduler(pool)``：一致性哈希调度器，select(key)
+  根据会话键在当前健康后端中按 SHA-256 评分选择，不维护游标或计数，
+  单次选择最坏 O(n) 时间、额外空间 O(1)。
 * ``ConnectionStateError``：释放使活动连接数低于零时抛出。
 """
 
 import argparse
 import bisect
+import hashlib
 import json
 import sys
 
@@ -34,6 +38,7 @@ __all__ = [
     "RoundRobinScheduler",
     "WeightedRoundRobinScheduler",
     "LeastConnectionsScheduler",
+    "ConsistentHashScheduler",
 ]
 
 _POLICY = "round_robin"
@@ -349,6 +354,65 @@ class LeastConnectionsScheduler:
         return {
             backend["id"]: self._counts[index]
             for index, backend in enumerate(self._pool._backends)
+        }
+
+
+class ConsistentHashScheduler:
+    """一致性哈希调度器。
+
+    不维护轮询游标或连接计数，选择完全由会话键与当前健康后端的 id
+    决定：把 [key, backend_id] 按 ensure_ascii=False 与紧凑分隔符
+    序列化为 UTF-8 后计算 SHA-256，摘要按无符号大端整数解释，分数
+    最大的健康后端胜出，分数相同时取声明顺序最前者。address、port、
+    weight 与声明位置均不参与评分。只比较当前健康后端，因此健康
+    变化在下一次 select 时立即生效：未选择故障后端的键保持原选择，
+    选择它的键在其余健康后端中重新映射；恢复健康后按同一评分规则
+    确定性地回到原后端。选择过程不改写池或任何调度器状态，也不建立
+    按键增长的缓存；单次选择最坏 O(n) 时间、额外空间 O(1)。
+    """
+
+    def __init__(self, pool):
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        self._pool = pool
+
+    def select(self, key):
+        """根据会话键选择一个当前健康的后端。
+
+        结果是键序固定为 id、address、port 的新字典；同一键在后端
+        集合与健康状态不变时，无论调用次数及与其他键的调用顺序如何，
+        都返回逐字段相同的结果。key 不是字符串时抛出 TypeError，
+        为空字符串时抛出 ValueError，且两种失败都不产生状态变化；
+        没有健康后端时抛出 NoAvailableBackendError。
+        """
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        if key == "":
+            raise ValueError("key must be a non-empty string")
+        chosen = -1
+        best_score = -1
+        for index, backend in enumerate(self._pool._backends):
+            if not backend["healthy"]:
+                continue
+            payload = json.dumps(
+                [key, backend["id"]],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            score = int.from_bytes(
+                hashlib.sha256(payload).digest(), "big", signed=False
+            )
+            # 只在严格更大时替换，分数相同则保留声明顺序最前者。
+            if score > best_score:
+                best_score = score
+                chosen = index
+        if chosen < 0:
+            raise NoAvailableBackendError("no healthy backend available")
+        backend = self._pool._backends[chosen]
+        return {
+            "id": backend["id"],
+            "address": backend["address"],
+            "port": backend["port"],
         }
 
 
