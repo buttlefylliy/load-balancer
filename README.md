@@ -26,6 +26,7 @@
 * 加权轮询按配置声明顺序构造逻辑循环，每个后端连续占有 `weight` 个位置。例如健康后端 A、B、C 权重为 2、1、3 时，选择顺序为 A、A、B、C、C、C 后重复。
 * 调度器从上次成功位置的下一个逻辑位置开始，整段跳过不健康后端占有的位置；`set_healthy` 立即影响下一次选择，恢复健康的后端从游标后方下一次遇到的自身位置重新参与，不补发停用期间错过的次数。
 * 实现不按权重展开保存重复后端项：调度器额外空间 O(n)，单次选择最坏 O(n)。
+* 库接口提供 `explain()`，不接入命令行，`schedule` 的参数、输出、异常类型与退出码保持不变。`explain()` 不推进游标即可预览下一次 `select()` 的确定性结果，返回键序固定为 policy、cursor、candidates、selected、outcome、reason、next_cursor 的隔离新字典：policy 固定为 `weighted_round_robin`；cursor 是调用前的逻辑游标，初始为 -1；candidates 按后端声明顺序排列，每项键序固定为 backend_id、healthy、weight、segment_start、segment_end，逻辑区间采用包含起点、不包含终点的整数边界，完整覆盖权重循环，不按权重展开重复项。存在健康后端时，解释从 cursor 的后继位置出发，沿用 `select()` 的整段跳过和回绕规则，selected 为 id、address、port 键序的后端副本，outcome 为 `selected`、reason 为 `weighted_round_robin`、next_cursor 为下次成功选择将写入的位置；池状态不变时，随后的 `select()` 返回同一后端并把游标推进到 next_cursor。所有后端均不健康时 explain 不抛出 `NoAvailableBackendError`，而返回全部候选且 selected 为 `null`、outcome 为 `failed`、reason 为 `no_healthy_backend`、next_cursor 等于 cursor；同一情形下 `select()` 仍抛出 `NoAvailableBackendError`。解释不修改游标、池或健康标记，修改返回对象不污染后续结果；池状态不变时重复调用逐字段一致，`set_healthy` 的变化立即反映在下一次解释中。单次解释最坏 O(n) 时间，除返回结果外只使用 O(1) 额外空间。
 
 `--policy least_connections` 使用最少连接策略：
 
