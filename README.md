@@ -22,6 +22,8 @@
 
 `schedule` 命令支持可选的 `--policy` 参数，省略时为 `round_robin`（输出与既有行为逐字节一致）；`--policy weighted_round_robin` 使用加权轮询。
 
+* 普通轮询的库接口提供 `RoundRobinScheduler(pool).explain()`：不调用 `select()` 即可预览下一次选择的确定性结果，不接入命令行，`schedule` 的参数、输出、异常类型、退出码与普通轮询的既有选择序列保持不变。返回键序固定为 policy、cursor、candidates、selected、outcome、reason、next_cursor 的新字典：policy 固定为 `round_robin`；cursor 为调用前最后一次成功选择的位置（初始为 -1）；candidates 按后端声明顺序排列，每项键序固定为 backend_id、healthy、position，position 是从零开始且稳定不变的声明位置。解释从 cursor 后一项开始并在末尾回绕，按 `select()` 的现有规则跳过不健康后端：存在健康后端时 selected 保持 id、address、port 键序，outcome 为 `selected`、reason 为 `round_robin`，next_cursor 为预计选中位置；池状态不变时，紧随其后的 `select()` 返回与 selected 相同的后端并把游标推进到 next_cursor。空池或全部后端不健康时 explain 不抛出 `NoAvailableBackendError`，仍返回全部候选且 selected 为 `null`、outcome 为 `failed`、reason 为 `no_healthy_backend`、next_cursor 等于 cursor；`select()` 在同一情形下仍抛出 `NoAvailableBackendError`。解释不改变游标、健康标记或池状态，修改返回的列表或字典不影响后续解释或选择；池状态不变时重复 explain 逐字段一致，`set_healthy()` 的变化立即体现在下一次解释中。单次解释最坏 O(n) 时间，除返回的 O(n) 结果外只使用 O(1) 额外空间。
+
 * 后端配置可声明可选的 `weight` 字段：缺省按 1 处理，显式值必须是 1 至 10000 的整数；布尔、浮点、字符串、零、负数或越界值均属于 `ConfigurationError`（退出码 3）。
 * 加权轮询按配置声明顺序构造逻辑循环，每个后端连续占有 `weight` 个位置。例如健康后端 A、B、C 权重为 2、1、3 时，选择顺序为 A、A、B、C、C、C 后重复。
 * 调度器从上次成功位置的下一个逻辑位置开始，整段跳过不健康后端占有的位置；`set_healthy` 立即影响下一次选择，恢复健康的后端从游标后方下一次遇到的自身位置重新参与，不补发停用期间错过的次数。
