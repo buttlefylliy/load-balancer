@@ -13,9 +13,12 @@
 * ``RoundRobinScheduler(pool)``：绑定后端池的轮询调度器。
 * ``RoundRobinScheduler.select()``：返回下一个健康后端，最坏 O(n) 时间、
   额外空间 O(1)。
+* ``WeightedRoundRobinScheduler(pool)``：按 weight 构造逻辑循环的加权轮询
+  调度器，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间 O(1)。
 """
 
 import argparse
+import bisect
 import json
 import sys
 
@@ -24,13 +27,18 @@ __all__ = [
     "NoAvailableBackendError",
     "BackendPool",
     "RoundRobinScheduler",
+    "WeightedRoundRobinScheduler",
 ]
 
 _POLICY = "round_robin"
+_WEIGHTED_POLICY = "weighted_round_robin"
 _FIELDS = ("id", "address", "port", "healthy")
+_OPTIONAL_FIELDS = ("weight",)
+_KNOWN_FIELDS = _FIELDS + _OPTIONAL_FIELDS
 _COMPLEXITY = (
     "复杂度：建池为 O(n) 时间与 O(n) 空间；"
-    "单次选择最坏 O(n) 时间且额外空间 O(1)。"
+    "单次选择最坏 O(n) 时间且额外空间 O(1)；"
+    "加权调度器额外保存 O(n) 的前缀和。"
 )
 
 
@@ -58,7 +66,7 @@ def _validate_configs(configs):
         if not isinstance(entry, dict):
             raise ConfigurationError(f"{location}: expected an object")
 
-        unknown = [key for key in entry if key not in _FIELDS]
+        unknown = [key for key in entry if key not in _KNOWN_FIELDS]
         if unknown:
             raise ConfigurationError(
                 f"{location}: unknown field {unknown[0]!r}"
@@ -98,6 +106,17 @@ def _validate_configs(configs):
                 f"{location}: healthy must be a boolean"
             )
 
+        # weight 为可选字段，缺省按 1 处理；布尔值是 int 的子类，必须显式排除。
+        weight = entry.get("weight", 1)
+        if isinstance(weight, bool) or not isinstance(weight, int):
+            raise ConfigurationError(
+                f"{location}: weight must be an integer between 1 and 10000"
+            )
+        if not 1 <= weight <= 10000:
+            raise ConfigurationError(
+                f"{location}: weight must be an integer between 1 and 10000"
+            )
+
         if backend_id in seen_ids:
             raise ConfigurationError(
                 f"duplicate backend id: {backend_id!r}"
@@ -110,6 +129,7 @@ def _validate_configs(configs):
                 "address": address,
                 "port": port,
                 "healthy": healthy,
+                "weight": weight,
             }
         )
 
@@ -190,6 +210,64 @@ class RoundRobinScheduler:
         raise NoAvailableBackendError("no healthy backend available")
 
 
+class WeightedRoundRobinScheduler:
+    """加权轮询调度器。
+
+    按声明顺序把每个后端映射到逻辑循环中连续 weight 个位置（不展开
+    保存重复项，只保存每个后端的段首偏移，O(n) 空间）。游标记录上一次
+    成功选择的逻辑位置，初始位于循环起点之前（-1）。每次选择从游标
+    后继位置开始，借助段首偏移整段跳过不健康后端占有的位置，至多检查
+    n 个后端：单次选择最坏 O(n) 时间、额外空间 O(1)。恢复健康标记的
+    变更立即影响下一次选择；没有健康后端时抛出 NoAvailableBackendError
+    且游标不变。
+    """
+
+    def __init__(self, pool):
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        self._pool = pool
+        offsets = []
+        position = 0
+        for backend in pool._backends:
+            offsets.append(position)
+            position += backend["weight"]
+        self._offsets = offsets
+        self._total = position
+        self._cursor = -1
+
+    def select(self):
+        """选择并返回下一个健康后端。
+
+        结果是键序固定为 id、address、port 的新字典；成功后游标推进到
+        所选逻辑位置。没有健康后端时抛出 NoAvailableBackendError，
+        池状态与游标均不改变。
+        """
+        backends = self._pool._backends
+        size = len(backends)
+        if self._total == 0:
+            raise NoAvailableBackendError("no healthy backend available")
+        position = (self._cursor + 1) % self._total
+        # 二分定位 position 所属的后端段，之后逐个后端检查；
+        # 不健康则直接跳到下一个后端的段首，至多检查 n 个后端。
+        index = bisect.bisect_right(self._offsets, position) - 1
+        for _ in range(size):
+            backend = backends[index]
+            if backend["healthy"]:
+                self._cursor = position
+                return {
+                    "id": backend["id"],
+                    "address": backend["address"],
+                    "port": backend["port"],
+                }
+            index += 1
+            if index == size:
+                index = 0
+                position = 0
+            else:
+                position = self._offsets[index]
+        raise NoAvailableBackendError("no healthy backend available")
+
+
 def _positive_int(value):
     try:
         number = int(value)
@@ -250,6 +328,12 @@ def _build_parser():
         metavar="N",
         help="连续选择的次数，必须为正整数",
     )
+    schedule.add_argument(
+        "--policy",
+        choices=(_POLICY, _WEIGHTED_POLICY),
+        default=_POLICY,
+        help="调度策略，省略时为 round_robin",
+    )
     schedule.set_defaults(handler=_handle_schedule)
     return parser
 
@@ -283,7 +367,10 @@ def _handle_schedule(args):
     except ConfigurationError as exc:
         _emit_error("ConfigurationError", exc, 3)
 
-    scheduler = RoundRobinScheduler(pool)
+    if args.policy == _WEIGHTED_POLICY:
+        scheduler = WeightedRoundRobinScheduler(pool)
+    else:
+        scheduler = RoundRobinScheduler(pool)
     selections = []
     try:
         for _ in range(args.count):
@@ -291,7 +378,7 @@ def _handle_schedule(args):
     except NoAvailableBackendError as exc:
         _emit_error("NoAvailableBackendError", exc, 4)
 
-    result = {"policy": _POLICY, "selections": selections}
+    result = {"policy": args.policy, "selections": selections}
     sys.stdout.write(
         json.dumps(result, separators=(",", ":"), ensure_ascii=False) + "\n"
     )
