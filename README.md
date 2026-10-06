@@ -45,6 +45,8 @@
 * 调度器不维护轮询游标、连接计数或按键增长的缓存：同一键在后端集合与健康状态不变时，无论调用次数及与其他键的调用顺序如何，都返回键序固定为 id、address、port 的逐字段相同新字典。
 * 每次选择只比较当前健康后端：某后端被标记为不健康后，原本未选择它的键保持原选择，原本选择它的键在其余健康后端中重新映射；该后端恢复健康后，相同键按原评分规则重新选择，此前属于它的键确定性地回到它。健康变化在下一次 `select` 立即生效，选择过程不改写池或调度器状态。
 * 单次选择最坏 O(n) 时间，除摘要计算所需的固定大小数据外额外空间 O(1)。
+* `explain(key)` 为一次一致性哈希选择给出可重放的解释：对 key 采用与 `select` 相同的类型和值校验（非字符串抛 `TypeError`、空字符串抛 `ValueError`，校验失败不改变状态），成功时返回键序固定为 `policy`、`key`、`candidates`、`selected`、`outcome`、`reason` 的新字典。`policy` 固定为 `consistent_hash`；`candidates` 按后端声明顺序排列，每项键序固定为 `backend_id`、`healthy`、`score`，健康后端的 `score` 为保留前导零的 64 位小写十六进制 SHA-256 摘要，不健康后端不参与比较且 `score` 为 `null`；`selected` 保持 `id`、`address`、`port` 的既有键序，`outcome` 为 `selected`、`reason` 为 `highest_score`，最高分相同时仍选择声明顺序最前的健康后端。
+* 池状态不变时，`explain` 返回的 `selected` 与 `select` 对同一 key 的结果逐字段一致。没有健康后端时 `explain` 不抛 `NoAvailableBackendError`（`select` 仍抛出），而是返回全部候选、`selected` 为 `null`、`outcome` 为 `failed`、`reason` 为 `no_healthy_backend`。返回结果与内部状态隔离，相同 key 与相同池状态下多次查询逐字段相同；查询不修改池或调度器、不留下按键累计的状态，单次查询 O(n) 时间，除返回的 O(n) 解释结果外只使用 O(1) 额外空间。
 
 ## 连接生命周期表（库接口）
 
