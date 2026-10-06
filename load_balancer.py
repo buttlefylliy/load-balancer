@@ -27,6 +27,13 @@
   额外空间 O(1)；``explain(key)`` 返回该次选择键序固定的可重放解释
   （全部候选与分数、selected、outcome、reason），与 select 同校验但
   无健康后端时不抛错，单次查询 O(n) 时间、除返回结果外额外空间 O(1)。
+* ``StickySessionScheduler(pool, max_sessions)``：有界会话绑定调度器，
+  以一致性哈希完成新键的首次选择与绑定后端故障后的重新选择；绑定仍健康
+  时始终返回原后端，不随健康集合增加而迁移，原后端恢复后也不主动迁回。
+  至多保存 max_sessions 个绑定，超出时淘汰最久未成功使用的键。命中为
+  O(1)，首次选择与迁移为 O(n)，``bindings()`` 完整查询与空间为
+  O(max_sessions)；``explain(key)`` 返回与紧随其后的 select 一致、
+  但不改变状态的可重放解释。
 * ``ConnectionTable(pool, idle_timeout, hard_timeout)``：以五元组标识连接、
   绑定后端池的连接生命周期表。时间只由显式 ``now`` 驱动；按五元组定位、
   记录活动与关闭平均 O(1) 时间，``advance`` 与完整查询 O(n) 时间，
@@ -41,6 +48,7 @@
 
 import argparse
 import bisect
+import collections
 import hashlib
 import heapq
 import json
@@ -56,6 +64,7 @@ __all__ = [
     "WeightedRoundRobinScheduler",
     "LeastConnectionsScheduler",
     "ConsistentHashScheduler",
+    "StickySessionScheduler",
     "ConnectionTable",
     "HealthCheckTracker",
 ]
@@ -559,6 +568,206 @@ class ConsistentHashScheduler:
             "selected": selected,
             "outcome": outcome,
             "reason": reason,
+        }
+
+
+def _sticky_score(key, backend_id):
+    """与一致性哈希调度器完全相同的评分：[key, backend_id] 的 SHA-256。"""
+    payload = json.dumps(
+        [key, backend_id],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return int.from_bytes(
+        hashlib.sha256(payload).digest(), "big", signed=False
+    )
+
+
+class StickySessionScheduler:
+    """有界会话绑定（粘性会话）调度器。
+
+    在一致性哈希之上维护至多 max_sessions 个 ``key -> backend_id`` 绑定，
+    绑定按最近成功使用顺序保存在 OrderedDict 中（首项最久未用、末项最近
+    使用）。新 key 按当前健康集合做一致性哈希首次选择并绑定；已绑定的
+    key 在绑定后端仍健康时始终返回它——即使健康集合增加（新后端或恢复
+    的后端评分更高）也不迁移，因此原后端恢复健康后不主动迁回。绑定后端
+    转为不健康时，按既有一致性哈希规则在当前健康后端中重新选择，并原子
+    替换原绑定。每次成功选择（命中或迁移）都把该 key 置为最近使用；新
+    绑定导致绑定数超过 max_sessions 时，淘汰最久未成功使用的 key，相同
+    事件序列必然产生相同的淘汰顺序。绑定后端不健康且没有任何健康后端时
+    抛出 NoAvailableBackendError，绑定与使用顺序均不改变；新 key 在没有
+    健康后端时同样失败且不留下绑定。
+
+    max_sessions 必须是排除布尔值的正整数，非法时抛出
+    ConfigurationError；pool 不是 BackendPool 时抛出 TypeError。全部
+    校验在任何状态建立之前完成。命中为 O(1)，首次选择与迁移为 O(n)，
+    bindings() 完整查询与空间为 O(max_sessions)。
+    """
+
+    def __init__(self, pool, max_sessions):
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        # bool 是 int 的子类，上限必须显式排除布尔值。
+        if (
+            isinstance(max_sessions, bool)
+            or not isinstance(max_sessions, int)
+            or max_sessions <= 0
+        ):
+            raise ConfigurationError(
+                "max_sessions must be a positive integer"
+            )
+        self._pool = pool
+        self._max_sessions = max_sessions
+        # key -> backend_id；OrderedDict 顺序即最近成功使用顺序，
+        # 首项最久未成功使用、末项最近成功使用。
+        self._bindings = collections.OrderedDict()
+
+    def _choose_consistent(self, key):
+        """按一致性哈希规则在当前健康后端中选择，返回其后端字典。
+
+        与 ConsistentHashScheduler.select 相同：评分最大者胜出，平分时
+        取声明顺序最前者；没有健康后端时抛出 NoAvailableBackendError。
+        """
+        backends = self._pool._backends
+        chosen = -1
+        best_score = -1
+        for index, backend in enumerate(backends):
+            if not backend["healthy"]:
+                continue
+            score = _sticky_score(key, backend["id"])
+            # 只在严格更大时替换，摘要相同保留声明顺序最前者。
+            if score > best_score:
+                best_score = score
+                chosen = index
+        if chosen < 0:
+            raise NoAvailableBackendError("no healthy backend available")
+        return backends[chosen]
+
+    def _backend_result(self, backend):
+        return {
+            "id": backend["id"],
+            "address": backend["address"],
+            "port": backend["port"],
+        }
+
+    def select(self, key):
+        """返回 key 绑定的健康后端，必要时首次绑定或故障转移。
+
+        结果是键序固定为 id、address、port 的新字典。key 不是字符串时
+        抛出 TypeError，为空字符串时抛出 ValueError；没有健康后端时
+        抛出 NoAvailableBackendError。任何失败都不改变绑定与使用顺序。
+        成功选择把 key 置为最近使用；仅当这是一个新绑定且绑定数超过
+        max_sessions 时，淘汰最久未成功使用的 key（迁移更新既有绑定，
+        不触发淘汰）。
+        """
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        if key == "":
+            raise ValueError("key must be a non-empty string")
+
+        bindings = self._bindings
+        bound_id = bindings.get(key)
+        if bound_id is not None:
+            index = self._pool._index[bound_id]
+            bound_backend = self._pool._backends[index]
+            if bound_backend["healthy"]:
+                # 粘性命中：健康集合增加也不迁移，只刷新使用顺序。
+                bindings.move_to_end(key)
+                return self._backend_result(bound_backend)
+
+        # 新 key 的首次选择，或绑定后端不健康时的故障转移；
+        # 没有健康后端时这里抛出，尚未触碰任何状态。
+        chosen = self._choose_consistent(key)
+
+        if bound_id is not None:
+            # 原子替换为重新选择的后端，并刷新使用顺序。
+            bindings[key] = chosen["id"]
+            bindings.move_to_end(key)
+        else:
+            bindings[key] = chosen["id"]  # 新键天然位于末尾
+            if len(bindings) > self._max_sessions:
+                bindings.popitem(last=False)
+        return self._backend_result(chosen)
+
+    def bindings(self):
+        """按最久到最近成功使用顺序返回绑定的隔离副本列表。
+
+        每项是键序固定为 key、backend_id 的新字典；返回列表与内部状态
+        完全隔离，调用方修改不影响后续选择。
+        """
+        return [
+            {"key": key, "backend_id": backend_id}
+            for key, backend_id in self._bindings.items()
+        ]
+
+    def explain(self, key):
+        """返回与紧随其后的 select（池状态不变时）一致的解释，不改状态。
+
+        与 select 采用相同的 key 校验：非字符串抛出 TypeError，空字符串
+        抛出 ValueError。结果是键序固定为 policy、key、
+        previous_backend_id、selected、outcome、reason、evicted_key、
+        base_decision 的新字典：policy 固定为 sticky_session；
+        previous_backend_id 为当前绑定后端 id（新 key 为 None）。存在
+        健康后端时 selected 是键序固定为 id、address、port 的新字典，
+        outcome 为 selected；reason 为 sticky_hit（绑定仍健康）、
+        new_binding（新 key）或 unhealthy_failover（绑定后端不健康后
+        重新选择）；new_binding 且绑定已满时 evicted_key 为随后 select
+        将淘汰的最久未用 key，否则为 None；sticky_hit 与故障转移不淘汰。
+        重新选择（new_binding/unhealthy_failover）时 base_decision 是
+        该 key 当前的一致性哈希解释，粘性命中时为 None。没有健康后端时
+        不抛错，selected 为 None、outcome 为 failed、reason 为
+        no_healthy_backend，其余字段反映当前绑定与假设的决策，且不改变
+        任何状态。
+        """
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        if key == "":
+            raise ValueError("key must be a non-empty string")
+
+        bindings = self._bindings
+        bound_id = bindings.get(key)
+        if bound_id is not None:
+            index = self._pool._index[bound_id]
+            bound_backend = self._pool._backends[index]
+        else:
+            bound_backend = None
+
+        if bound_backend is not None and bound_backend["healthy"]:
+            selected = self._backend_result(bound_backend)
+            outcome = "selected"
+            reason = "sticky_hit"
+            evicted_key = None
+            base_decision = None
+        else:
+            base_decision = ConsistentHashScheduler(self._pool).explain(key)
+            if base_decision["selected"] is None:
+                selected = None
+                outcome = "failed"
+                reason = "no_healthy_backend"
+                evicted_key = None
+            else:
+                selected = dict(base_decision["selected"])
+                outcome = "selected"
+                if bound_id is None:
+                    reason = "new_binding"
+                    # 与 select 的淘汰规则一致：只有新绑定且已满才淘汰；
+                    # 已存在的 key 位于末尾，首项即最久未用的其他 key。
+                    if len(bindings) >= self._max_sessions:
+                        evicted_key = next(iter(bindings))
+                    else:
+                        evicted_key = None
+                else:
+                    reason = "unhealthy_failover"
+                    evicted_key = None
+        return {
+            "policy": "sticky_session",
+            "key": key,
+            "previous_backend_id": bound_id,
+            "selected": selected,
+            "outcome": outcome,
+            "reason": reason,
+            "evicted_key": evicted_key,
+            "base_decision": base_decision,
         }
 
 
