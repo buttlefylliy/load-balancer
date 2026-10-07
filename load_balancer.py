@@ -49,6 +49,22 @@
   failures、backends）的累计统计隔离副本，只由 select 与成功的
   release_connection 累计，选择与释放只增加 O(1) 统计开销，完整查询
   O(n) 时间与 O(n) 返回空间，摘除或恢复后端保留累计值。
+* ``QueuedLeastConnectionsScheduler(pool, max_queue, queue_timeout)``：
+  带等待队列的最少连接调度器（库接口，不接入 schedule），为每个后端
+  维护与其他调度器和连接表完全独立、从零开始的活动连接数，并维护至多
+  max_queue 项的先进先出等待队列。max_queue 与 queue_timeout 必须是
+  排除布尔值的正整数，否则抛出 ConfigurationError。``submit``、
+  ``release_and_dispatch`` 与 ``advance`` 共享一条只由显式 now 驱动的
+  单调时间线（非布尔非负整数，回退抛出 ConnectionStateError），健康
+  变化在下一次操作生效。submit 先清理到期项，再沿用最少连接规则在健康
+  且未满载的后端中选择；无健康后端抛出 NoAvailableBackendError，健康
+  后端均满载且队列未满时入队并返回 queued，队列已满抛出
+  BackendOverloadedError，同一 request_id 仍在等待时重复提交幂等返回
+  原结果。release_and_dispatch 先完整校验并释放一个连接，再清理到期项，
+  然后尝试把队首仍可分配的请求按同一规则分配给任一可用后端。advance 只
+  推进时间并按入队顺序返回本次到期项。pending 返回队列顺序的隔离副本。
+  选择与释放后分配最坏 O(n)，入队与逐项过期摊销 O(1)，查询 O(q)，
+  状态空间 O(n+max_queue)。
 * ``ConsistentHashScheduler(pool)``：一致性哈希调度器，``select(key)``
   按会话键对当前健康后端评分（SHA-256 摘要取无符号大端整数，分数最大者
   胜出），不维护游标、连接计数或按键增长的缓存，单次选择最坏 O(n) 时间、
@@ -117,7 +133,7 @@ import hashlib
 import heapq
 import json
 import sys
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 __all__ = [
     "ConfigurationError",
@@ -129,6 +145,7 @@ __all__ = [
     "RoundRobinScheduler",
     "WeightedRoundRobinScheduler",
     "LeastConnectionsScheduler",
+    "QueuedLeastConnectionsScheduler",
     "ConsistentHashScheduler",
     "StickySessionScheduler",
     "RetryChainScheduler",
@@ -996,6 +1013,298 @@ class LeastConnectionsScheduler:
             "outcome": outcome,
             "reason": reason,
         }
+
+
+class QueuedLeastConnectionsScheduler:
+    """带等待队列的最少连接调度器（库接口，不接入 schedule）。
+
+    为每个后端维护与其他调度器和 ConnectionTable 完全独立、从零开始的
+    活动连接数（O(n) 空间），并以先进先出 deque 与按 request_id 的索引
+    字典维护至多 max_queue 个等待请求。时间只由调用方显式传入的 now
+    驱动，不读墙上时钟：submit、release_and_dispatch 与 advance 共享
+    同一单调时间线，now 必须是非布尔的非负整数且不得回退；初始时刻为
+    None，首个携带 now 的入口把时钟初始化为该值。健康变化在下一次入口
+    操作扫描后端时立即生效，不清除或改写计数与队列。
+
+    submit 先清理截止时间不晚于 now 的等待请求，再沿用
+    LeastConnectionsScheduler 的规则在当前健康且计数低于自身
+    max_connections 的后端中取计数最小者（同分取声明顺序最前者），成功
+    时把该后端计数加一并返回 selected。没有健康后端时抛出
+    NoAvailableBackendError；存在健康后端但全部满载时，只要队列未满就
+    把请求入队并返回 queued，队列已满则抛出 BackendOverloadedError。
+    同一 request_id 仍在等待时重复提交幂等返回原 queued 结果，不重新
+    校验时钟或清理队列。任何校验或选择失败都不改变时钟、队列或计数。
+
+    release_and_dispatch 先完成全部输入校验并释放指定后端的一个连接，
+    再把时钟推进到 now 并清理到期项，然后尝试把队首仍有效的请求按同一
+    最少连接规则分配给任一可用后端：暂不可分配（队列已空或没有健康且
+    未满的后端）时保留请求且 dispatched 为 null。advance 只推进时间并
+    按入队顺序返回本次到期请求，不尝试分配。pending 按队列顺序返回
+    隔离副本。
+
+    选择与释放后的分配最坏 O(n) 时间；入队为 O(1)，逐项过期在所有入口
+    上摊销 O(1)（入队时刻单调且 queue_timeout 固定，等待期限单调不减，
+    到期项始终构成队首前缀）；查询为 O(q)；状态空间 O(n+max_queue)。
+    """
+
+    def __init__(self, pool, max_queue, queue_timeout):
+        # 先完成 pool、max_queue 与 queue_timeout 的全部校验，再建立任何
+        # 实例状态；校验失败时对象不会被部分构造。
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        for name, value in (
+            ("max_queue", max_queue),
+            ("queue_timeout", queue_timeout),
+        ):
+            # bool 是 int 的子类，上限必须显式排除布尔值。
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ConfigurationError(
+                    f"{name} must be a positive integer"
+                )
+        self._pool = pool
+        self._max_queue = max_queue
+        self._queue_timeout = queue_timeout
+        # 与 LeastConnectionsScheduler 完全独立的活动连接计数。
+        self._counts = [0] * len(pool._backends)
+        # 等待队列：deque 中每项为 [request_id, queued_at, expires_at]，
+        # _waiting 按 request_id 指向同一项，保证幂等重提与逐项移除 O(1)。
+        self._queue = deque()
+        self._waiting = {}
+        self._now = None
+
+    def _validate_now(self, now):
+        """校验显式时间：非布尔非负整数，且不得早于共享时间线。"""
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be an integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        if self._now is not None and now < self._now:
+            raise ConnectionStateError("now must not move backwards")
+
+    def _prune_expired(self, now):
+        """移除所有截止时间不晚于 now 的等待项，返回被移除的条目列表。
+
+        入队时刻沿单调时间线只增不减且 queue_timeout 固定，因此等待期限
+        单调不减，到期项始终构成队首前缀；每个条目至多入队与出队各一次，
+        所有入口上逐项摊销 O(1)。
+        """
+        expired = []
+        queue = self._queue
+        waiting = self._waiting
+        while queue and queue[0][2] <= now:
+            entry = queue.popleft()
+            del waiting[entry[0]]
+            expired.append(entry)
+        return expired
+
+    def _choose_backend(self):
+        """按最少连接规则选择健康且未满的后端，返回声明位置或 -1。
+
+        返回 -1 且无任何健康后端时调用方应抛 NoAvailableBackendError；
+        返回 -1 但存在健康后端时表示健康后端全部满载。
+        """
+        chosen = -1
+        saw_healthy = False
+        for index, backend in enumerate(self._pool._backends):
+            if not backend["healthy"]:
+                continue
+            saw_healthy = True
+            limit = backend["max_connections"]
+            if limit is not None and self._counts[index] >= limit:
+                continue
+            if chosen < 0 or self._counts[index] < self._counts[chosen]:
+                chosen = index
+        return chosen, saw_healthy
+
+    @staticmethod
+    def _result(request_id, outcome, backend, queued_at, expires_at, reason):
+        """构造键序固定为 request_id、outcome、backend、queued_at、
+        expires_at、reason 的新字典。"""
+        return {
+            "request_id": request_id,
+            "outcome": outcome,
+            "backend": backend,
+            "queued_at": queued_at,
+            "expires_at": expires_at,
+            "reason": reason,
+        }
+
+    def submit(self, request_id, now):
+        """提交一个请求：立即选择后端，或在所有健康后端满载时入队等待。
+
+        request_id 必须是非空字符串：非字符串抛出 TypeError，空字符串
+        抛出 ValueError。同一 request_id 仍在队列中等待时，重复提交幂等
+        返回原 queued 结果的新副本（backend 为 null、queued_at 与
+        expires_at 为原值），不推进时钟、不清理到期项也不重复入队。
+        其余情况下 now 必须是非布尔非负整数且不早于共享时间线，类型错误
+        抛出 TypeError，负值抛出 ValueError，时间回退抛出
+        ConnectionStateError。先把时钟推进到 now 并清理截止时间不晚于
+        now 的等待项，再做选择：成功时计数加一，返回 outcome 为 selected、
+        backend 为被选后端 id、queued_at 与 expires_at 为 null、reason 为
+        least_connections 的结果；没有健康后端时抛出
+        NoAvailableBackendError；健康后端均满载且队列未满时入队并返回
+        outcome 为 queued、backend 为 null、queued_at 为 now、expires_at
+        为 now 加 queue_timeout、reason 为
+        all_healthy_backends_at_capacity 的结果；队列已满时抛出
+        BackendOverloadedError。任何失败都不改变时钟、队列或计数。
+        """
+        if not isinstance(request_id, str):
+            raise TypeError("request_id must be a string")
+        if request_id == "":
+            raise ValueError("request_id must be a non-empty string")
+        existing = self._waiting.get(request_id)
+        if existing is not None:
+            return self._result(
+                request_id,
+                "queued",
+                None,
+                existing[1],
+                existing[2],
+                "all_healthy_backends_at_capacity",
+            )
+        self._validate_now(now)
+
+        self._now = now
+        self._prune_expired(now)
+        chosen, saw_healthy = self._choose_backend()
+        if chosen < 0:
+            if not saw_healthy:
+                raise NoAvailableBackendError(
+                    "no healthy backend available"
+                )
+            if len(self._queue) >= self._max_queue:
+                raise BackendOverloadedError(
+                    "wait queue is full and all healthy backends are at "
+                    "capacity"
+                )
+            expires_at = now + self._queue_timeout
+            entry = [request_id, now, expires_at]
+            self._queue.append(entry)
+            self._waiting[request_id] = entry
+            return self._result(
+                request_id,
+                "queued",
+                None,
+                now,
+                expires_at,
+                "all_healthy_backends_at_capacity",
+            )
+        self._counts[chosen] += 1
+        backend_id = self._pool._backends[chosen]["id"]
+        return self._result(
+            request_id,
+            "selected",
+            backend_id,
+            None,
+            None,
+            "least_connections",
+        )
+
+    def release_and_dispatch(self, backend_id, now):
+        """释放一个连接，并尝试把队首有效请求分配给任一可用后端。
+
+        backend_id 必须是池内字符串 id：非字符串抛出 TypeError，未知 id
+        抛出 KeyError，对应后端当前没有可释放的连接（计数为零）时抛出
+        ConnectionStateError；now 沿用 submit 的非布尔非负整数与单调时间
+        线校验。全部输入校验完成后才产生任何修改：先释放该后端的一个
+        连接，再推进时钟并清理截止时间不晚于 now 的等待项，然后把队首
+        仍有效的请求按 submit 的同一最少连接规则分配给当前健康且未满的
+        后端（计数加一）。
+        队列为空或当前没有健康且未满的后端时不分配，队列中的请求全部
+        保留且 dispatched 为 null。结果是键序固定为 released_backend_id、
+        dispatched 的新字典：released_backend_id 为被释放后端的 id，
+        dispatched 为被分配请求的 submit 风格结果（保留其原始 queued_at
+        与 expires_at，outcome 为 selected、backend 为实际分到的后端
+        id、reason 为 least_connections），暂不可分配时为 null。释放
+        总会生效一次；选择与分配最坏 O(n) 时间。
+        """
+        if not isinstance(backend_id, str):
+            raise TypeError("backend id must be a string")
+        # bool 是 int 的子类，时间戳必须显式排除布尔值。
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be an integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        index = self._pool._index.get(backend_id)
+        if index is None:
+            raise KeyError(backend_id)
+        if self._now is not None and now < self._now:
+            raise ConnectionStateError("now must not move backwards")
+        if self._counts[index] == 0:
+            raise ConnectionStateError(
+                f"backend {backend_id!r} has no active connection to release"
+            )
+
+        # 全部校验通过后才落盘：先释放，再推进时钟与惰性清理，最后分配。
+        self._counts[index] -= 1
+        self._now = now
+        self._prune_expired(now)
+
+        dispatched = None
+        # 到期项始终构成队首前缀并已被清理；队列非空时队首即最旧的有效
+        # 请求，只尝试它一次：当前没有健康且未满的后端时原样保留。
+        if self._queue:
+            chosen, _saw_healthy = self._choose_backend()
+            if chosen >= 0:
+                entry = self._queue.popleft()
+                del self._waiting[entry[0]]
+                self._counts[chosen] += 1
+                assigned = self._pool._backends[chosen]["id"]
+                dispatched = self._result(
+                    entry[0],
+                    "selected",
+                    assigned,
+                    entry[1],
+                    entry[2],
+                    "least_connections",
+                )
+        return {
+            "released_backend_id": backend_id,
+            "dispatched": dispatched,
+        }
+
+    def advance(self, now):
+        """只推进共享时钟，按入队顺序返回本次到期的等待请求。
+
+        now 沿用其他入口的非布尔非负整数与单调时间线校验，类型错误抛出
+        TypeError，负值抛出 ValueError，时间回退抛出
+        ConnectionStateError；校验失败不改变时钟或队列。同一时刻重复推进
+        幂等返回空列表。不尝试分配任何请求，也不改变连接计数。结果是新
+        列表，每项是键序固定为 request_id、queued_at、expires_at 的新
+        字典，按入队顺序排列；等待期限单调不减使到期项始终是队首前缀，
+        逐项过期在所有入口上摊销 O(1)。
+        """
+        self._validate_now(now)
+        self._now = now
+        expired = self._prune_expired(now)
+        return [
+            {
+                "request_id": entry[0],
+                "queued_at": entry[1],
+                "expires_at": entry[2],
+            }
+            for entry in expired
+        ]
+
+    def pending(self):
+        """按队列顺序（最旧到最新）返回等待请求的隔离副本。
+
+        每项是键序固定为 request_id、queued_at、expires_at 的新字典；
+        返回列表与内部队列隔离，修改它不影响后续行为。查询为 O(q)
+        时间与 O(q) 返回空间，q 为当前队列长度。
+        """
+        return [
+            {
+                "request_id": entry[0],
+                "queued_at": entry[1],
+                "expires_at": entry[2],
+            }
+            for entry in self._queue
+        ]
 
 
 class ConsistentHashScheduler:
