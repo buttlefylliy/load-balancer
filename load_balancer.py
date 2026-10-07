@@ -57,14 +57,18 @@
   空间 O(n)。
 * ``ConnectionStateError``：连接状态非法时抛出（释放使活动连接数低于零、
   对非 active 连接记录活动、五元组冲突、now 回退等）。
-* ``HealthCheckTracker(pool, failure_threshold, recovery_threshold)``：
-  只消费显式检查结果的健康跟踪器，按连续失败/成功次数在共享池中自动
-  摘除与回切后端；不发起网络请求、不读取墙上时钟。单次记录平均 O(1)
-  时间，完整查询 O(n) 时间，空间 O(n)；``explain(backend_id, success,
-  now)`` 返回键序固定为 backend_id、success、checked_at、healthy、
-  changed、consecutive_failures、consecutive_successes、reason 的只读
-  预览，与 record_result 同校验同判定但不修改任何状态，单次 O(1) 时间
-  与 O(1) 额外空间。
+* ``HealthCheckTracker(pool, failure_threshold, recovery_threshold,
+  stale_timeout=None)``：只消费显式检查结果的健康跟踪器，按连续失败/
+  成功次数在共享池中自动摘除与回切后端；不发起网络请求、不读取墙上
+  时钟。单次记录平均 O(1) 时间，完整查询 O(n) 时间，空间 O(n)；
+  ``explain(backend_id, success, now)`` 返回键序固定为 backend_id、
+  success、checked_at、healthy、changed、consecutive_failures、
+  consecutive_successes、reason 的只读预览，与 record_result 同校验
+  同判定但不修改任何状态，单次 O(1) 时间与 O(1) 额外空间。可选的
+  stale_timeout 启用检查失联超时：``advance(now)`` 推进与
+  record_result 共享的事件时钟，把 checked_at + stale_timeout 不晚于
+  now 的当前健康后端在共享池中摘除，单次推进最坏 O(n) 时间、除返回
+  列表外 O(1) 额外空间。
 """
 
 import argparse
@@ -1522,11 +1526,19 @@ class HealthCheckTracker:
     set_healthy 改变状态后，下一次记录以池中实际状态为准并重置该
     后端的连续计数。
 
+    可选的 stale_timeout 启用检查失联超时：``advance(now)`` 推进与
+    record_result 共享的显式事件时钟（同样的类型、非负与全局单调
+    约束），把当前健康、已有检查结果且 checked_at + stale_timeout
+    不晚于 now 的后端在共享池中标为不健康，并清零其连续计数；省略
+    或传入 None 时不启用超时，advance 只推进时间。
+
     单次记录平均 O(1) 时间，statuses 完整查询 O(n) 时间，空间 O(n)。
-    ``explain`` 单次为 O(1) 时间与 O(1) 额外空间。
+    ``explain`` 单次为 O(1) 时间与 O(1) 额外空间。``advance`` 单次
+    最坏 O(n) 时间，除返回列表外 O(1) 额外空间，不保存事件历史。
     """
 
-    def __init__(self, pool, failure_threshold, recovery_threshold):
+    def __init__(self, pool, failure_threshold, recovery_threshold,
+                 stale_timeout=None):
         if not isinstance(pool, BackendPool):
             raise TypeError("pool must be a BackendPool instance")
         for name, value in (
@@ -1542,9 +1554,20 @@ class HealthCheckTracker:
                 raise ConfigurationError(
                     f"{name} must be a positive integer"
                 )
+        # stale_timeout 缺省（None）表示不启用检查失联超时；
+        # bool 是 int 的子类，显式值必须显式排除布尔值。
+        if stale_timeout is not None and (
+            isinstance(stale_timeout, bool)
+            or not isinstance(stale_timeout, int)
+            or stale_timeout <= 0
+        ):
+            raise ConfigurationError(
+                "stale_timeout must be a positive integer"
+            )
         self._pool = pool
         self._failure_threshold = failure_threshold
         self._recovery_threshold = recovery_threshold
+        self._stale_timeout = stale_timeout
         self._now = None
         # 每个后端的跟踪状态，按声明顺序平行于 pool._backends。
         self._states = [
@@ -1729,6 +1752,70 @@ class HealthCheckTracker:
             "consecutive_successes": successes,
             "reason": reason,
         }
+
+    def advance(self, now):
+        """推进事件时钟到 now，摘除检查失联的健康后端并返回摘除项列表。
+
+        now 与 record_result 共享同一时间线与校验：非布尔的非负整数，
+        且不得早于本跟踪器已见的任何事件时间；类型错误抛出 TypeError，
+        负值抛出 ValueError，时间回退抛出 ConnectionStateError。先完成
+        全部校验再推进时间与修改状态，校验失败不留下任何部分变更。
+        同一 now 重复推进是幂等的：首次推进已摘除的后端不再满足条件，
+        后续推进返回空列表。
+
+        启用 stale_timeout 时，按声明顺序检查每个后端：当前健康、已有
+        检查结果且 checked_at + stale_timeout 不晚于 now 的后端在本次
+        推进中于共享池内标为不健康，连续成功与失败计数清零（后续
+        record_result 从零累计，仍按 recovery_threshold 回切），
+        checked_at 保留最后检查时间；从未检查或已经不健康的后端不产生
+        变化。未启用 stale_timeout 时只推进时间，不摘除任何后端。
+
+        返回按池声明顺序排列的新摘除项列表，每项是键序固定为
+        backend_id、healthy、changed、checked_at、expired_at、reason
+        的新字典：healthy 为 False、changed 为 True、checked_at 保留
+        最后检查时间、expired_at 等于本次 now、reason 为
+        health_check_timeout。没有变化时返回空列表；返回对象与内部
+        状态隔离，修改它不影响后续行为。单次推进最坏 O(n) 时间，除
+        返回列表外 O(1) 额外空间。
+        """
+        # bool 是 int 的子类，时间戳必须显式排除布尔值。
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be an integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        if self._now is not None and now < self._now:
+            raise ConnectionStateError("now must not move backwards")
+
+        self._now = now
+        removed = []
+        if self._stale_timeout is None:
+            return removed
+        for index, backend in enumerate(self._pool._backends):
+            if not backend["healthy"]:
+                continue
+            state = self._states[index]
+            checked_at = state["checked_at"]
+            if checked_at is None:
+                continue
+            if checked_at + self._stale_timeout > now:
+                continue
+            backend_id = backend["id"]
+            self._pool.set_healthy(backend_id, False)
+            state["known_healthy"] = False
+            state["consecutive_failures"] = 0
+            state["consecutive_successes"] = 0
+            state["changed"] = True
+            removed.append(
+                {
+                    "backend_id": backend_id,
+                    "healthy": False,
+                    "changed": True,
+                    "checked_at": checked_at,
+                    "expired_at": now,
+                    "reason": "health_check_timeout",
+                }
+            )
+        return removed
 
     def statuses(self):
         """按后端声明顺序返回全部后端的状态（新字典组成的新列表）。
