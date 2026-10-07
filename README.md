@@ -29,6 +29,8 @@
 * 调度器从上次成功位置的下一个逻辑位置开始，整段跳过不健康后端占有的位置；`set_healthy` 立即影响下一次选择，恢复健康的后端从游标后方下一次遇到的自身位置重新参与，不补发停用期间错过的次数。
 * 实现不按权重展开保存重复后端项：调度器额外空间 O(n)，单次选择最坏 O(n)。
 * 库接口提供 `explain()`：不推进游标即可预览下一次 `select()` 的确定性结果，不接入命令行，`schedule` 的参数、输出、异常类型、退出码、权重校验与选择序列保持不变。返回键序固定为 policy、cursor、candidates、selected、outcome、reason、next_cursor 的新字典：policy 固定为 `weighted_round_robin`；cursor 为调用前的逻辑游标（初始为 -1）；candidates 按后端声明顺序排列，每项键序固定为 backend_id、healthy、weight、segment_start、segment_end，段边界为包含起点、不包含终点的整数边界，完整覆盖权重循环而不按权重展开重复项。存在健康后端时，解释从 cursor 的后继位置出发，沿用 `select` 的整段跳过与回绕规则，selected 保持 id、address、port 键序，outcome 为 `selected`、reason 为 `weighted_round_robin`，next_cursor 为下次成功选择将写入的位置；池状态不变时，随后的 `select()` 返回同一后端并把游标推进到 next_cursor。全部后端均不健康时 explain 不抛出 `NoAvailableBackendError`，而是返回全部候选且 selected 为 `null`、outcome 为 `failed`、reason 为 `no_healthy_backend`、next_cursor 等于 cursor；同一情形下 `select` 仍抛出 `NoAvailableBackendError`。解释不修改游标、池或健康标记，修改返回对象不污染后续结果；池状态不变时重复调用逐字段一致，`set_healthy` 的变化立即反映在下一次解释中；单次查询 O(n) 时间，除返回的 O(n) 解释结果外只使用 O(1) 额外空间。
+* 库接口另提供 `statistics()`（不接入命令行，`schedule` 的参数、输出、异常类型与退出码保持不变）：返回键序固定为 policy、attempts、succeeded、failed、failures、backends 的新字典，policy 固定为 `weighted_round_robin`，各累计计数从零开始且为非负整数。每次 `select()` 调用增加 attempts：成功时同时增加 succeeded 与实际返回后端的 selected（单次成功只加一，weight 只决定命中频率，不按权重重复计数）；空池或全部后端不健康时仍抛出 `NoAvailableBackendError`、游标保持不变，只增加 failed 与 failures 中的 `no_healthy_backend`（failures 仅含该固定键），不改变任何后端的 selected。`explain()`、`statistics()` 及健康标记变化均不累计任何事件。backends 按池声明顺序排列，每项键序固定为 backend_id、selected；后端摘除或恢复时保留全部累计值，恢复后继续沿用原累计值。多个绑定同一 `BackendPool` 的调度器实例各自维护互不影响的统计。
+* `statistics()` 返回的字典、failures 字典与 backends 列表全部为新建对象，修改它们不污染内部状态或后续结果；状态不变时重复调用逐字段相同。累计状态占用 O(n) 空间，选择只增加 O(1) 统计开销，完整查询使用 O(n) 时间与 O(n) 返回空间。
 
 `--policy least_connections` 使用最少连接策略：
 
@@ -37,7 +39,7 @@
 * `schedule` 命令中的 count 次选择视为依次建立且未释放的连接；没有健康后端时仍以退出码 4 结束，存在健康后端但全部达到上限时在 stderr 输出键序为 type、message 的紧凑 JSON（类型 `BackendOverloadedError`、消息 `all healthy backends are at capacity`）并以退出码 5 结束；两种失败都不在 stdout 留下部分结果。`BackendOverloadedError` 可从 `load_balancer` 直接导入。
 * 库接口提供 `release_connection(backend_id)` 与 `active_connections()`：释放成功只把对应计数减一，释放出的空位立即可用于下一次选择；重复释放到零以下抛出 `ConnectionStateError` 且任何计数不变；id 非字符串抛出 `TypeError`，id 不存在抛出 `KeyError`。查询返回与内部状态隔离、按声明顺序排列的新字典。
 * 库接口另提供 `statistics()`（不接入命令行，`schedule` 的参数、输出、异常类型与退出码保持不变）：返回键序固定为 policy、attempts、succeeded、failed、released、failures、backends 的新字典，policy 固定为 `least_connections`，各累计计数从零开始且为非负整数。每次 `select()` 调用增加 attempts：成功时同时增加 succeeded 与被选后端的 selected，活动连接照常加一；没有健康后端仍抛出 `NoAvailableBackendError`、健康后端全部满载仍抛出 `BackendOverloadedError`，两种失败只增加 failed 与 failures 中对应的失败原因（键序为 no_healthy_backend、all_healthy_backends_at_capacity），不改变任何连接数。`release_connection` 成功时增加 released 总数与目标后端的 released 并照常减少活动连接；参数类型错误、未知 id 或从零继续释放仍抛出现有异常，全部统计与连接状态不变。`explain()`、`active_connections()`、`statistics()` 及健康标记变化均不累计任何事件。backends 按池声明顺序排列，每项键序固定为 backend_id、selected、released、active_connections，其中 selected 与 released 为该后端的累计计数，active_connections 沿用现有实时计数；后端摘除或恢复时保留全部累计值。
-* `statistics()` 返回的字典、failures 字典与 backends 列表全部为新建对象，修改它们不污染内部状态或后续结果；状态不变时重复调用逐字段相同。累计状态占用 O(n) 空间，选择与释放只增加 O(1) 统计开销，完整查询使用 O(n) 时间与 O(n) 返回空间；其他调度器不增加任何统计。
+* `statistics()` 返回的字典、failures 字典与 backends 列表全部为新建对象，修改它们不污染内部状态或后续结果；状态不变时重复调用逐字段相同。累计状态占用 O(n) 空间，选择与释放只增加 O(1) 统计开销，完整查询使用 O(n) 时间与 O(n) 返回空间；未提供 `statistics()` 的调度器不增加任何统计。
 * 健康状态变化立即影响后续选择，但不清除或改写已有计数；不健康的后端仍允许释放既有连接，恢复健康后按保留的计数与上限重新参与比较。
 * 构造为 O(n) 时间与 O(n) 额外空间，单次选择最坏 O(n)、额外空间 O(1)，单次释放 O(1)，计数查询 O(n)，不按容量展开存储。
 
