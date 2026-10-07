@@ -168,6 +168,19 @@
   任一失败不留下部分修改；成功时按输入顺序返回与 record_result
   相同键序的结果列表，k 个条目使用 O(k) 时间与 O(k) 暂存及返回
    空间。
+* ``HealthCheckTracker.export_log()`` / 类级入口
+  ``HealthCheckTracker.replay_log(pool, failure_threshold,
+  recovery_threshold, stale_timeout, text)``：确定性的内存事件日志
+  与重建入口。record_result、record_batch、advance 每次成功返回后
+  按调用顺序追加一个事件（幂等重复、无状态变化的推进与全幂等批次
+  也各记录一次，抛出异常的调用不记录）；导出入口返回无末尾换行的
+  紧凑 JSON 数组，事件键序固定为 sequence、operation、now、
+  payload；重放入口先完成解析与结构校验，再以传入池重放前的健康
+  状态为起点在新跟踪器上按 sequence 顺序执行，日志结构非法或事件
+  无法合法执行时统一抛出 ConfigurationError（文本非字符串抛出
+  TypeError），失败不修改传入池也不暴露部分结果。单次追加 O(1)
+  时间与空间，导出 O(e)，重放状态空间 O(e+n)，e 为事件数、
+  n 为后端数。
 * ``CircuitBreakerScheduler(pool, failure_threshold, reset_timeout)``：
   按后端维护 closed、open、half_open 熔断状态与连续失败计数的调度器
   （库接口，不接入 schedule），failure_threshold 与 reset_timeout 必须是
@@ -2889,6 +2902,105 @@ class ConnectionTable:
         return table
 
 
+_HEALTH_EVENT_FIELDS = ("sequence", "operation", "now", "payload")
+_HEALTH_EVENT_OPERATIONS = ("record", "batch", "advance")
+_HEALTH_RESULT_FIELDS = ("backend_id", "success")
+
+
+def _validate_health_result_entry(entry, location):
+    """校验单条检查结果载荷的结构，返回键序固定的规范化新字典。
+
+    任何结构问题都统一抛出 ConfigurationError；不会修改调用方对象。
+    返回字典的键序固定为 backend_id、success。
+    """
+    if not isinstance(entry, dict):
+        raise ConfigurationError(f"{location}: expected an object")
+    unknown = [key for key in entry if key not in _HEALTH_RESULT_FIELDS]
+    if unknown:
+        raise ConfigurationError(f"{location}: unknown field {unknown[0]!r}")
+    missing = [
+        key for key in _HEALTH_RESULT_FIELDS if key not in entry
+    ]
+    if missing:
+        raise ConfigurationError(f"{location}: missing field {missing[0]!r}")
+    backend_id = entry["backend_id"]
+    if not isinstance(backend_id, str):
+        raise ConfigurationError(f"{location}: backend_id must be a string")
+    success = entry["success"]
+    if not isinstance(success, bool):
+        raise ConfigurationError(f"{location}: success must be a boolean")
+    return {"backend_id": backend_id, "success": success}
+
+
+def _validate_health_log_event(event, position):
+    """校验单条健康检查日志事件的结构，返回规范化后的执行参数元组。
+
+    任何结构问题（事件不是对象、未知或缺失字段、类型错误、序号不连续、
+    未知操作或 payload 与操作不符）都统一抛出 ConfigurationError；不会
+    修改调用方对象。返回 (operation, now, payload)，其中 payload 为
+    规范化结果字典（record）、规范化结果字典组成的新列表（batch）
+    或 None（advance）。
+    """
+    location = f"event at position {position}"
+    if not isinstance(event, dict):
+        raise ConfigurationError(f"{location}: expected an object")
+    unknown = [key for key in event if key not in _HEALTH_EVENT_FIELDS]
+    if unknown:
+        raise ConfigurationError(f"{location}: unknown field {unknown[0]!r}")
+    missing = [key for key in _HEALTH_EVENT_FIELDS if key not in event]
+    if missing:
+        raise ConfigurationError(f"{location}: missing field {missing[0]!r}")
+
+    sequence = event["sequence"]
+    # bool 是 int 的子类，序号必须显式排除布尔值。
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        raise ConfigurationError(f"{location}: sequence must be an integer")
+    if sequence != position:
+        raise ConfigurationError(
+            f"{location}: sequence must increase contiguously from zero"
+        )
+
+    operation = event["operation"]
+    if not isinstance(operation, str) or (
+        operation not in _HEALTH_EVENT_OPERATIONS
+    ):
+        raise ConfigurationError(
+            f"{location}: operation must be one of "
+            f"{_HEALTH_EVENT_OPERATIONS!r}"
+        )
+
+    now = event["now"]
+    # bool 是 int 的子类，时间戳必须显式排除布尔值。
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise ConfigurationError(f"{location}: now must be an integer")
+    if now < 0:
+        raise ConfigurationError(
+            f"{location}: now must be a non-negative integer"
+        )
+
+    payload = event["payload"]
+    if operation == "advance":
+        if payload is not None:
+            raise ConfigurationError(
+                f"{location}: advance requires a null payload"
+            )
+        prepared = None
+    elif operation == "record":
+        prepared = _validate_health_result_entry(payload, location)
+    else:
+        if not isinstance(payload, list):
+            raise ConfigurationError(
+                f"{location}: batch requires a list payload"
+            )
+        prepared = [
+            _validate_health_result_entry(
+                entry, f"{location} payload at position {index}"
+            )
+            for index, entry in enumerate(payload)
+        ]
+    return operation, now, prepared
+
+
 class HealthCheckTracker:
     """只消费显式检查结果、在共享池中自动摘除与回切后端的跟踪器。
 
@@ -2918,6 +3030,17 @@ class HealthCheckTracker:
     ``record_batch`` 在同一事件时刻原子提交一批结果：先完成整批校验
     与判定再一次性提交，任一失败不留下部分修改，k 个条目使用 O(k)
     时间与 O(k) 暂存及返回空间。
+
+    每次 record_result、record_batch 或 advance 成功返回后，按调用
+    顺序向内存事件日志追加一个事件（幂等重复、无状态变化的推进与
+    全幂等批次也各记录一次；抛出异常的调用不新增或改写日志）。日志
+    不记录 statuses、explain、export_log 或外部 set_healthy 调用。
+    ``export_log()`` 把日志导出为无末尾换行的紧凑 JSON 数组；类级
+    入口 ``replay_log(pool, failure_threshold, recovery_threshold,
+    stale_timeout, text)`` 先完成解析与结构校验，再以传入池重放前
+    的健康状态为起点在新跟踪器上按 sequence 顺序重放并返回该跟踪器。
+    单次追加 O(1) 时间与空间，导出 O(e)，重放状态空间 O(e+n)，
+    e 为事件数、n 为后端数。
     """
 
     def __init__(self, pool, failure_threshold, recovery_threshold,
@@ -2966,6 +3089,20 @@ class HealthCheckTracker:
             }
             for backend in pool._backends
         ]
+        # 确定性内存事件日志：只在三个写操作成功返回后追加，元素为键序
+        # 固定的新字典，sequence 从零连续递增。
+        self._events = []
+
+    def _append_event(self, operation, now, payload):
+        """把一次成功操作追加到内存事件日志，O(1) 时间与空间。"""
+        self._events.append(
+            {
+                "sequence": len(self._events),
+                "operation": operation,
+                "now": now,
+                "payload": payload,
+            }
+        )
 
     def _validate_event(self, backend_id, success, now):
         """校验一次检查事件，返回后端在声明顺序中的位置。
@@ -3082,6 +3219,10 @@ class HealthCheckTracker:
                     f"conflicting result for backend {backend_id!r} "
                     f"at now={now}"
                 )
+            # 幂等重复也记录一次事件。
+            self._append_event(
+                "record", now, {"backend_id": backend_id, "success": success}
+            )
             return dict(state["last_result"])
 
         # 外部 set_healthy 造成的状态偏移在下一次记录时被发现：
@@ -3093,6 +3234,9 @@ class HealthCheckTracker:
             index, backend_id, success, now, actual, projection
         )
         self._now = now
+        self._append_event(
+            "record", now, {"backend_id": backend_id, "success": success}
+        )
         return result
 
     def record_batch(self, results, now):
@@ -3199,6 +3343,15 @@ class HealthCheckTracker:
                 )
             )
         self._now = now
+        # 全幂等批次也记录一次事件；载荷按输入顺序保存规范化新字典。
+        self._append_event(
+            "batch",
+            now,
+            [
+                {"backend_id": backend_id, "success": success}
+                for backend_id, success in prepared
+            ],
+        )
         return committed
 
     def explain(self, backend_id, success, now):
@@ -3288,6 +3441,8 @@ class HealthCheckTracker:
         if self._now is not None and now < self._now:
             raise ConnectionStateError("now must not move backwards")
         self._now = now
+        # 无状态变化的推进（含未启用 stale_timeout）也记录一次事件。
+        self._append_event("advance", now, None)
 
         if self._stale_timeout is None:
             return []
@@ -3340,6 +3495,85 @@ class HealthCheckTracker:
                 }
             )
         return report
+
+    def export_log(self):
+        """把内存事件日志导出为无末尾换行的紧凑 JSON 数组字符串。
+
+        数组按调用顺序排列，每个事件对象的键固定为 sequence、
+        operation、now、payload：sequence 从零连续递增；operation 为
+        record、batch、advance 之一；record 事件的 payload 是键序固定
+        为 backend_id、success 的对象，batch 事件的 payload 是按输入
+        顺序排列的同结构对象数组，advance 事件的 payload 为 null。
+        日志只记录成功返回的 record_result、record_batch 与 advance
+        调用（含幂等重复、无状态变化的推进与全幂等批次），不记录
+        statuses、explain、export_log 或外部 set_healthy 调用。状态
+        不变时重复导出逐字节一致；导出结果为新建字符串，调用方对象与
+        返回内容都不能污染内部日志。O(e) 时间，e 为事件数。
+        """
+        return json.dumps(
+            self._events, separators=(",", ":"), ensure_ascii=False
+        )
+
+    @classmethod
+    def replay_log(cls, pool, failure_threshold, recovery_threshold,
+                   stale_timeout, text):
+        """按事件日志在新 HealthCheckTracker 上重放并返回该跟踪器。
+
+        先完成 text 的解析与全部事件的结构校验，再以 pool 重放前的
+        健康状态为起点，在绑定 pool 的新跟踪器上按 sequence 顺序执行；
+        重放经由 record_result、record_batch 与 advance 的既有入口，
+        因此连续计数、最近检查时间、池健康标记、事件时钟与内存日志都
+        按原样恢复，新事件从下一序号继续。text 非字符串抛出
+        TypeError；非法 JSON、顶层非数组、未知或缺失字段、类型错误、
+        序号不连续、未知 operation、payload 不合规，以及按给定池的
+        初始状态无法合法执行的事件，统一抛出 ConfigurationError。
+        任何失败都不修改传入池（执行期间写入的健康标记会在抛出前
+        恢复），也不暴露部分结果。failure_threshold、
+        recovery_threshold 与 stale_timeout 沿用构造函数的既有校验。
+        对仅经三个写入口变化的原实例，返回跟踪器的 statuses、后续
+        explain 与再次导出的日志与原实例一致。重放除 advance 的既有
+        扫描成本外使用 O(e+n) 空间，e 为事件数、n 为后端数。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        try:
+            events = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(
+                f"invalid JSON: {exc}"
+            ) from None
+        if not isinstance(events, list):
+            raise ConfigurationError("event log must be a JSON array")
+        # 先完成全部事件的结构校验，再建立任何可见状态。
+        prepared = [
+            _validate_health_log_event(event, position)
+            for position, event in enumerate(events)
+        ]
+
+        # 构造参数沿用既有异常；构造成功后的任何重放失败都必须把
+        # 传入池恢复到重放前的健康状态。
+        tracker = cls(pool, failure_threshold, recovery_threshold,
+                      stale_timeout)
+        snapshot = [backend["healthy"] for backend in pool._backends]
+        try:
+            for position, (operation, now, payload) in enumerate(prepared):
+                if operation == "record":
+                    tracker.record_result(
+                        payload["backend_id"], payload["success"], now
+                    )
+                elif operation == "batch":
+                    tracker.record_batch(payload, now)
+                else:
+                    tracker.advance(now)
+        except (TypeError, ValueError, KeyError,
+                ConnectionStateError) as exc:
+            for backend, healthy in zip(pool._backends, snapshot):
+                backend["healthy"] = healthy
+            raise ConfigurationError(
+                f"event at position {position} cannot be replayed: "
+                f"{exc}"
+            ) from None
+        return tracker
 
 
 class CircuitBreakerScheduler:
