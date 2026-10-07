@@ -119,13 +119,19 @@
   本实例的 select 累计，选择只增加 O(1) 统计开销，完整查询 O(n) 时间
   与 O(n) 返回空间，摘除或恢复后端保留累计值。
 * ``RetryChainScheduler(pool, max_attempts)``：跨后端有界重试链调度器
-  （库接口，不接入 schedule），自身无状态：``next_backend(key,
-  failed_backend_ids)`` 在当前健康且未在本链失败的后端中沿用一致性
-  哈希评分取最高者，max_attempts 包含首次选择；无健康后端抛
-  NoAvailableBackendError，达到尝试上限或健康后端均已失败时抛
-  RetryExhaustedError；``explain(key, failed_backend_ids)`` 同校验
-  同规则，但无候选时返回解释而不抛选择异常。单次查询 O(n+m) 时间、
-  除 explain 的 O(n) 返回值外额外 O(m) 空间，m 受 max_attempts 限制。
+  （库接口，不接入 schedule），不维护游标或按链状态：
+  ``next_backend(key, failed_backend_ids)`` 在当前健康且未在本链
+  失败的后端中沿用一致性哈希评分取最高者，max_attempts 包含首次
+  选择；无健康后端抛 NoAvailableBackendError，达到尝试上限或健康
+  后端均已失败时抛 RetryExhaustedError；``explain(key,
+  failed_backend_ids)`` 同校验同规则，但无候选时返回解释而不抛
+  选择异常。单次查询 O(n+m) 时间、除 explain 的 O(n) 返回值外
+  额外 O(m) 空间，m 受 max_attempts 限制。``statistics()`` 返回
+  键序固定（policy、attempts、succeeded、failed、outcomes、
+  failures、backends）的累计统计隔离副本，只由本实例的
+  next_backend 累计，有效调用只增加 O(1) 统计开销，完整查询
+  O(n) 时间与 O(n) 返回空间，摘除或恢复后端与配置热加载均保留
+  累计值。
 * ``ConnectionTable(pool, idle_timeout, hard_timeout)``：以五元组标识连接、
   绑定后端池的连接生命周期表。时间只由显式 ``now`` 驱动；按五元组定位、
   记录活动与关闭平均 O(1) 时间，``advance`` 与完整查询 O(n) 时间，
@@ -2120,9 +2126,9 @@ class StickySessionScheduler:
 class RetryChainScheduler:
     """跨后端有界重试链调度器（库接口，不接入 schedule）。
 
-    调度器自身无状态、不维护游标或任何按链累计的数据：每次调用都由
-    调用方显式传入本链已经失败的后端 id 列表，并依据共享池当前的健康
-    标记重新评分。max_attempts 是包含首次选择在内的尝试总次数：
+    调度器不维护游标或任何按链累计的选择状态：每次调用都由调用方显式
+    传入本链已经失败的后端 id 列表，并依据共享池当前的健康标记重新
+    评分（仅 statistics 的累计计数随调用增长）。max_attempts 是包含首次选择在内的尝试总次数：
     failed_backend_ids 为空时给出首次选择，每失败一个后端后携带其 id
     再次调用即可取得下一次尝试。候选必须当前健康且不在失败链中；评分
     沿用 ConsistentHashScheduler 的规则（``[key, backend_id]`` 的紧凑
@@ -2135,6 +2141,17 @@ class RetryChainScheduler:
     已达到 max_attempts（首次选择在内的尝试次数已用完），或仍有健康
     后端但它们全部已在本链失败时，抛出 RetryExhaustedError。失败链
     长度超过 max_attempts 属于调用方错误，抛出 ValueError。
+
+    ``statistics()`` 返回本实例构造以来累计的调用统计：key 与失败链
+    通过完整校验的每次 next_backend 调用都计入 attempts，成功时同时
+    计入 succeeded、实际返回后端的 selected，以及 outcomes 中的
+    initial_selection（失败链为空）或 retry_after_failure（失败链
+    非空）；无健康后端的失败计入 failed 与 failures 中的
+    no_healthy_backend，预算用尽或健康后端均已在本链失败的失败计入
+    failed 与 failures 中的 retries_exhausted。explain、statistics
+    与健康标记变化、配置热加载均不累计或清零任何事件，摘除或恢复后端
+    保留全部累计值。统计只描述通过本实例发生的 next_backend 调用，
+    不影响共享同一后端池的其他调度器实例。
     """
 
     def __init__(self, pool, max_attempts):
@@ -2153,6 +2170,20 @@ class RetryChainScheduler:
             )
         self._pool = pool
         self._max_attempts = max_attempts
+        # 累计统计按声明顺序与后端平行保存；统计只增不减，健康标记变化、
+        # 配置热加载与只读查询都不触碰这些值，额外空间 O(n)。
+        self._stats_attempts = 0
+        self._stats_succeeded = 0
+        self._stats_failed = 0
+        self._stats_outcomes = {
+            "initial_selection": 0,
+            "retry_after_failure": 0,
+        }
+        self._stats_failures = {
+            "no_healthy_backend": 0,
+            "retries_exhausted": 0,
+        }
+        self._stats_selected = [0] * len(pool._backends)
 
     def _validate_chain(self, key, failed_backend_ids):
         """校验 key 与失败链，返回与调用方列表隔离的失败 id 集合。
@@ -2201,9 +2232,22 @@ class RetryChainScheduler:
         后端均已在本链失败时，抛 RetryExhaustedError。单次查询
         O(n+m) 时间、O(m) 额外空间，m 为失败链长度且不超过
         max_attempts。
+
+        key 与失败链通过完整校验后，每次调用先把 attempts 加一；成功
+        时同时把 succeeded、实际返回后端的 selected，以及 outcomes 中
+        的 initial_selection（失败链为空）或 retry_after_failure
+        （失败链非空）各加一。没有健康后端抛出 NoAvailableBackendError
+        时只增加 failed 与 failures 中的 no_healthy_backend；预算用尽
+        或健康后端均已在本链失败而抛出 RetryExhaustedError 时只增加
+        failed 与 failures 中的 retries_exhausted。TypeError、
+        ValueError、KeyError 等校验失败不改变任何统计，选择失败也不
+        增加任何后端命中。
         """
         failed = self._validate_chain(key, failed_backend_ids)
         backends = self._pool._backends
+        # key 与失败链通过完整校验的每次调用都计入尝试，包括随后抛出
+        # 选择异常的调用。
+        self._stats_attempts += 1
         chosen = -1
         best_score = -1
         saw_healthy = False
@@ -2231,14 +2275,74 @@ class RetryChainScheduler:
                 best_score = score
                 chosen = index
         if not saw_healthy:
+            self._stats_failed += 1
+            self._stats_failures["no_healthy_backend"] += 1
             raise NoAvailableBackendError("no healthy backend available")
         if not budget_left or chosen < 0:
+            self._stats_failed += 1
+            self._stats_failures["retries_exhausted"] += 1
             raise RetryExhaustedError("retry chain is exhausted")
         backend = backends[chosen]
+        self._stats_succeeded += 1
+        self._stats_selected[chosen] += 1
+        if failed_backend_ids:
+            self._stats_outcomes["retry_after_failure"] += 1
+        else:
+            self._stats_outcomes["initial_selection"] += 1
         return {
             "id": backend["id"],
             "address": backend["address"],
             "port": backend["port"],
+        }
+
+    def statistics(self):
+        """返回本实例构造以来累计的调用统计的隔离副本。
+
+        结果是键序固定为 policy、attempts、succeeded、failed、
+        outcomes、failures、backends 的新字典：policy 固定为
+        retry_chain；attempts、succeeded、failed 为从零开始的非负
+        整数累计计数；outcomes 是键序固定为 initial_selection、
+        retry_after_failure 的新字典；failures 是键序固定为
+        no_healthy_backend、retries_exhausted 的新字典；backends 按
+        池声明顺序排列，每项键序固定为 backend_id、selected，即使
+        后端从未被选中、当前不健康或随后恢复，也保留对应的零值或
+        累计值。key 与失败链通过完整校验的每次 next_backend 调用
+        增加 attempts：成功时同时增加 succeeded、实际返回后端的
+        selected 与对应的 outcome，无健康后端的失败只增加 failed 与
+        failures 中的 no_healthy_backend，预算用尽或健康后端均已在
+        本链失败的失败只增加 failed 与 failures 中的
+        retries_exhausted；TypeError、ValueError、KeyError 等校验
+        失败不改变统计。explain、statistics、健康标记变化与配置热
+        加载均不累计或清零任何事件，摘除或恢复后端保留累计值，多个
+        绑定同一池的调度器实例各自维护互不影响的统计。返回字典与
+        列表全部为新建对象，修改它们不污染内部状态或后续结果；池
+        状态不变时重复调用逐字段相同。单次查询 O(n) 时间与 O(n)
+        返回空间。
+        """
+        return {
+            "policy": "retry_chain",
+            "attempts": self._stats_attempts,
+            "succeeded": self._stats_succeeded,
+            "failed": self._stats_failed,
+            "outcomes": {
+                "initial_selection":
+                    self._stats_outcomes["initial_selection"],
+                "retry_after_failure":
+                    self._stats_outcomes["retry_after_failure"],
+            },
+            "failures": {
+                "no_healthy_backend":
+                    self._stats_failures["no_healthy_backend"],
+                "retries_exhausted":
+                    self._stats_failures["retries_exhausted"],
+            },
+            "backends": [
+                {
+                    "backend_id": backend["id"],
+                    "selected": self._stats_selected[index],
+                }
+                for index, backend in enumerate(self._pool._backends)
+            ],
         }
 
     def explain(self, key, failed_backend_ids):
