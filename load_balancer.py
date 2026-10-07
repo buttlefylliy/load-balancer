@@ -30,7 +30,10 @@
   O(1)，单次释放 O(1)；``explain()`` 返回键序固定的可重放解释
   （全部候选的连接数、容量与 eligible、selected、outcome、reason），
   与 select 同规则但没有健康后端或全部已满时不抛错，不改变任何状态，
-  单次查询 O(n) 时间、除返回结果外额外空间 O(1)。
+  单次查询 O(n) 时间、除返回结果外额外空间 O(1)；``statistics()``
+  返回键序固定为 policy、attempts、succeeded、failed、released、
+  failures、backends 的累计统计快照，选择与释放只增加 O(1) 统计开销，
+  完整查询 O(n) 时间与 O(n) 返回空间，累计状态额外占用 O(n) 空间。
 * ``ConsistentHashScheduler(pool)``：一致性哈希调度器，``select(key)``
   按会话键对当前健康后端评分（SHA-256 摘要取无符号大端整数，分数最大者
   胜出），不维护游标、连接计数或按键增长的缓存，单次选择最坏 O(n) 时间、
@@ -555,6 +558,11 @@ class LeastConnectionsScheduler:
     调度异常、不增加任何计数：返回包含全部候选的连接数、容量与
     eligible 标记、选中结果与失败原因的可重放解释字典，健康变化与
     release_connection 的结果立即体现在下一次解释中。
+
+    除活动连接数外，调度器还为每个后端维护从零开始的累计选中与释放
+    次数，以及全局累计的尝试、成功、失败与释放次数（连同按原因区分的
+    失败计数，整体额外 O(n) 空间）。``statistics()`` 返回这些累计值
+    与实时活动连接数的隔离快照。摘除或恢复健康标记都不重置累计值。
     """
 
     def __init__(self, pool):
@@ -562,18 +570,34 @@ class LeastConnectionsScheduler:
             raise TypeError("pool must be a BackendPool instance")
         self._pool = pool
         self._counts = [0] * len(pool._backends)
+        # 累计统计：所有计数从零开始且只增不减，健康摘除/恢复不重置。
+        self._attempts = 0
+        self._succeeded = 0
+        self._failed = 0
+        self._released_total = 0
+        # 平行于 _counts 的每后端累计选中与释放次数。
+        self._selected_counts = [0] * len(pool._backends)
+        self._released_counts = [0] * len(pool._backends)
+        # 失败原因键序固定为 no_healthy_backend、
+        # all_healthy_backends_at_capacity。
+        self._failure_counts = {
+            "no_healthy_backend": 0,
+            "all_healthy_backends_at_capacity": 0,
+        }
 
     def select(self):
         """选择当前健康且未满容量、活动连接数最小的后端。
 
-        结果是键序固定为 id、address、port 的新字典；成功后被选后端的
-        活动连接数先加一再返回。没有健康后端时抛出
+        每次调用都先累计一次 attempts。结果是键序固定为 id、address、
+        port 的新字典；成功时同时累计 succeeded 与被选后端的 selected，
+        被选后端的活动连接数先加一再返回。没有健康后端时抛出
         NoAvailableBackendError；存在健康后端但计数全部达到各自
         max_connections 上限时抛出 BackendOverloadedError。两种失败
-        都不改变任何计数。
+        都只累计 failed 与对应原因，不改变任何活动连接数。
         """
         backends = self._pool._backends
         counts = self._counts
+        self._attempts += 1
         chosen = -1
         saw_healthy = False
         for index, backend in enumerate(backends):
@@ -586,12 +610,17 @@ class LeastConnectionsScheduler:
             if chosen < 0 or counts[index] < counts[chosen]:
                 chosen = index
         if chosen < 0:
+            self._failed += 1
             if not saw_healthy:
+                self._failure_counts["no_healthy_backend"] += 1
                 raise NoAvailableBackendError("no healthy backend available")
+            self._failure_counts["all_healthy_backends_at_capacity"] += 1
             raise BackendOverloadedError(
                 "all healthy backends are at capacity"
             )
         counts[chosen] += 1
+        self._succeeded += 1
+        self._selected_counts[chosen] += 1
         backend = backends[chosen]
         return {
             "id": backend["id"],
@@ -602,9 +631,10 @@ class LeastConnectionsScheduler:
     def release_connection(self, backend_id):
         """按 id 释放一个活动连接，对应计数减一。
 
-        不健康的后端同样允许释放。id 不是字符串时抛出 TypeError，
-        id 不存在时抛出 KeyError；计数已为零时抛出
-        ConnectionStateError，且任何计数都不改变。
+        释放成功时累计 released 总数与目标后端的 released，活动连接数
+        照常减一。不健康的后端同样允许释放。id 不是字符串时抛出
+        TypeError，id 不存在时抛出 KeyError；计数已为零时抛出
+        ConnectionStateError；这些失败时全部统计与连接状态都不改变。
         """
         if not isinstance(backend_id, str):
             raise TypeError("backend id must be a string")
@@ -616,15 +646,61 @@ class LeastConnectionsScheduler:
                 f"backend {backend_id!r} has no active connection to release"
             )
         self._counts[index] -= 1
+        self._released_total += 1
+        self._released_counts[index] += 1
 
     def active_connections(self):
         """返回全部后端的活动连接数。
 
         结果是与内部状态隔离的新字典，键按声明顺序排列，值为非负整数。
+        查询本身不累计任何事件。
         """
         return {
             backend["id"]: self._counts[index]
             for index, backend in enumerate(self._pool._backends)
+        }
+
+    def statistics(self):
+        """返回累计统计与实时活动连接数的隔离快照，不累计任何事件。
+
+        结果是键序固定为 policy、attempts、succeeded、failed、released、
+        failures、backends 的新字典：policy 固定为 least_connections；
+        attempts、succeeded、failed、released 为从零开始的非负整数，
+        分别累计每次 select 调用、成功选择、失败选择与成功释放，恒有
+        attempts 等于 succeeded 与 failed 之和。failures 是键序固定为
+        no_healthy_backend、all_healthy_backends_at_capacity 的新字典，
+        分别累计两种失败原因，两者之和等于 failed。backends 按池声明
+        顺序排列，每项是键序固定为 backend_id、selected、released、
+        active_connections 的新字典：selected 与 released 为该后端从
+        零开始的累计选中与成功释放次数，active_connections 沿用实时
+        活动连接数。摘除或恢复健康标记不清除任何累计值。explain()、
+        active_connections()、本查询及健康标记变化均不累计事件；池与
+        调度器状态不变时重复调用逐字段相同，修改返回的字典或列表不
+        污染后续结果。单次查询 O(n) 时间与 O(n) 返回空间。
+        """
+        backends = self._pool._backends
+        counts = self._counts
+        return {
+            "policy": "least_connections",
+            "attempts": self._attempts,
+            "succeeded": self._succeeded,
+            "failed": self._failed,
+            "released": self._released_total,
+            "failures": {
+                "no_healthy_backend":
+                    self._failure_counts["no_healthy_backend"],
+                "all_healthy_backends_at_capacity":
+                    self._failure_counts["all_healthy_backends_at_capacity"],
+            },
+            "backends": [
+                {
+                    "backend_id": backend["id"],
+                    "selected": self._selected_counts[index],
+                    "released": self._released_counts[index],
+                    "active_connections": counts[index],
+                }
+                for index, backend in enumerate(backends)
+            ],
         }
 
     def explain(self):
