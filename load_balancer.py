@@ -2916,8 +2916,18 @@ class CircuitBreakerScheduler:
     一个当前健康、已到期且探测未被占用的 half_open 后端；half_open
     候选与 closed 候选一同按分数比较。没有任何健康后端时抛出
     NoAvailableBackendError；存在健康后端但全部处于 open 或其唯一探测
-    已被占用时抛出 CircuitOpenError。记录为 O(1)，选择与解释最坏
-    O(n)，状态空间 O(n)。
+    已被占用时抛出 CircuitOpenError。
+
+    ``statistics()`` 返回本实例构造以来累计的选择统计：每次通过 key 与
+    now 校验的 select 调用（无论成功或抛出失败）都计入 attempts，成功
+    时同时计入 succeeded 与实际返回后端的 selected（选中 closed 或取得
+    half_open 探测资格都只计一次），没有任何健康后端的失败只计入 failed
+    与 failures 中的 no_healthy_backend，存在健康后端但全部熔断或探测
+    占用的失败只计入 failed 与 all_circuits_open。key 或 now 校验失败、
+    时间回退、record_result、explain、statistics 与健康标记变化均不累计
+    任何事件，也不清零统计；摘除或恢复后端与熔断状态转换保留全部累计值。
+    统计只描述通过本实例发生的 select 调用，不影响共享同一后端池的其他
+    调度器实例。记录为 O(1)，选择与解释最坏 O(n)，状态空间 O(n)。
     """
 
     _CLOSED = "closed"
@@ -2960,6 +2970,16 @@ class CircuitBreakerScheduler:
             }
             for _backend in pool._backends
         ]
+        # 累计统计按声明顺序与后端平行保存；统计只增不减，健康标记变化、
+        # record_result、explain 与只读查询都不触碰这些值，额外空间 O(n)。
+        self._stats_attempts = 0
+        self._stats_succeeded = 0
+        self._stats_failed = 0
+        self._stats_failures = {
+            "no_healthy_backend": 0,
+            "all_circuits_open": 0,
+        }
+        self._stats_selected = [0] * len(pool._backends)
 
     def _validate_time(self, now):
         """校验共享时间入口：非布尔非负整数且不得回退。"""
@@ -3171,15 +3191,20 @@ class CircuitBreakerScheduler:
         key 沿用一致性哈希校验：非字符串抛出 TypeError，空字符串抛出
         ValueError；now 必须是非布尔非负整数且不得回退，类型错误抛出
         TypeError，负值抛出 ValueError，回退抛出
-        ConnectionStateError。成功时返回键序固定为 id、address、port 的
-        新字典：在健康且 closed 的后端与至多一个健康、已到期且探测未
-        被占用的 half_open 后端中按 SHA-256 评分取最高者，同分取声明
-        顺序最前者。选中 half_open 后端时立即占用其唯一探测，记录探测
-        结果前该后端不再参与选择。没有任何健康后端时抛出
-        NoAvailableBackendError；存在健康后端但全部处于 open 或探测
-        已占用时抛出 CircuitOpenError。失败不改变时钟或熔断状态；成功
-        选择推进共享时钟并在占用探测时改写占用标记。最坏 O(n) 时间、
-        除固定大小数据外额外 O(n) 用于候选判定（不向外返回）。
+        ConnectionStateError，三种校验失败均不产生任何统计变化。成功时
+        返回键序固定为 id、address、port 的新字典：在健康且 closed 的
+        后端与至多一个健康、已到期且探测未被占用的 half_open 后端中按
+        SHA-256 评分取最高者，同分取声明顺序最前者。通过全部校验后先把
+        attempts 加一；成功时把 succeeded 与实际返回后端的 selected 各
+        加一（选中 closed 或取得 half_open 探测资格都只计一次），命中
+        计数与探测占用、时钟推进在同一提交点生效。选中 half_open 后端时
+        立即占用其唯一探测，记录探测结果前该后端不再参与选择。没有任何
+        健康后端时抛出 NoAvailableBackendError，只增加 failed 与
+        failures 中的 no_healthy_backend；存在健康后端但全部处于 open
+        或探测已占用时抛出 CircuitOpenError，只增加 failed 与
+        all_circuits_open：两种失败都不留下后端命中、不推进时钟或改变
+        熔断状态。最坏 O(n) 时间、除固定大小数据外额外 O(n) 用于候选
+        判定（不向外返回），统计更新只增加 O(1) 开销。
         """
         if not isinstance(key, str):
             raise TypeError("key must be a string")
@@ -3187,26 +3212,78 @@ class CircuitBreakerScheduler:
             raise ValueError("key must be a non-empty string")
         self._validate_time(now)
 
+        # 通过 key 与 now 的全部校验后才计入尝试，包括随后抛出失败异常的调用。
+        self._stats_attempts += 1
         _candidates, chosen, saw_healthy, has_eligible = self._plan(key, now)
         if not saw_healthy:
+            self._stats_failed += 1
+            self._stats_failures["no_healthy_backend"] += 1
             raise NoAvailableBackendError("no healthy backend available")
         if not has_eligible or chosen < 0:
+            self._stats_failed += 1
+            self._stats_failures["all_circuits_open"] += 1
             raise CircuitOpenError(
                 "all healthy backends have open circuits or probes in flight"
             )
 
         state = self._states[chosen]
-        # 选中到期后端即占用唯一的半开探测，并把观察到的 half_open
-        # 落盘为存储状态；open_until 保留原值直到探测结果记录。
+        # 全部判定完成后一次性提交：选中到期后端即占用唯一的半开探测，
+        # 并把观察到的 half_open 落盘为存储状态；open_until 保留原值直到
+        # 探测结果记录。探测占用、时钟推进与命中计数同时生效。
         if self._effective_state(state, now) == self._HALF_OPEN:
             state["state"] = self._HALF_OPEN
             state["probe_in_flight"] = True
         self._now = now
+        self._stats_succeeded += 1
+        self._stats_selected[chosen] += 1
         backend = self._pool._backends[chosen]
         return {
             "id": backend["id"],
             "address": backend["address"],
             "port": backend["port"],
+        }
+
+    def statistics(self):
+        """返回本实例构造以来累计的选择统计的隔离副本。
+
+        结果是键序固定为 policy、attempts、succeeded、failed、
+        failures、backends 的新字典：policy 固定为 circuit_breaker；
+        attempts、succeeded、failed 为从零开始的非负整数累计计数；
+        failures 是键序固定为 no_healthy_backend、all_circuits_open 的
+        新字典；backends 按池声明顺序排列，每项键序固定为 backend_id、
+        selected，即使后端从未被选中、当前不健康、摘除后恢复或经历熔断
+        转换，也保留对应的零值或累计值。每次通过 key 与 now 校验的
+        select 调用增加 attempts：成功时同时增加 succeeded 与实际返回
+        后端的 selected（选中 closed 或取得 half_open 探测资格都只计
+        一次），没有任何健康后端的失败只增加 failed 与
+        no_healthy_backend，存在健康后端但全部熔断或探测占用的失败只
+        增加 failed 与 all_circuits_open。key 类型或空值错误、now 类型
+        或取值错误与时间回退均不产生统计变化；record_result、explain、
+        statistics、健康标记变化与配置热加载均不累计或清零统计；摘除或
+        恢复后端与熔断转换保留累计值，多个绑定同一池的调度器实例各自
+        维护互不影响的统计。返回字典、failures 字典与 backends 列表
+        全部为新建对象，修改它们不污染内部状态或后续结果；状态不变时
+        重复调用逐字段相同。单次查询 O(n) 时间与 O(n) 返回空间。
+        """
+        backends = self._pool._backends
+        return {
+            "policy": "circuit_breaker",
+            "attempts": self._stats_attempts,
+            "succeeded": self._stats_succeeded,
+            "failed": self._stats_failed,
+            "failures": {
+                "no_healthy_backend":
+                    self._stats_failures["no_healthy_backend"],
+                "all_circuits_open":
+                    self._stats_failures["all_circuits_open"],
+            },
+            "backends": [
+                {
+                    "backend_id": backend["id"],
+                    "selected": self._stats_selected[index],
+                }
+                for index, backend in enumerate(backends)
+            ],
         }
 
     def explain(self, key, now):
