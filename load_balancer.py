@@ -110,6 +110,28 @@
   RetryExhaustedError；``explain(key, failed_backend_ids)`` 同校验
   同规则，但无候选时返回解释而不抛选择异常。单次查询 O(n+m) 时间、
   除 explain 的 O(n) 返回值外额外 O(m) 空间，m 受 max_attempts 限制。
+* ``CircuitBreakerScheduler(pool, failure_threshold, reset_timeout)``：
+  按后端维护 closed、open、half_open 状态与连续失败计数的熔断器调度器
+  （库接口，不接入 schedule），不改写共享池健康标记。failure_threshold
+  与 reset_timeout 只接受排除布尔值的正整数，否则抛出
+  ConfigurationError；pool 类型错误抛出 TypeError。
+  ``record_result(backend_id, success, now)`` 记录请求结果：closed 成功
+  清零计数，连续失败达到阈值时转为 open 且 open_until 为
+  now + reset_timeout；到期后转为 half_open，探测成功关闭并清零，探测
+  失败以 now 为基准重新打开。同一后端同一 now 的相同结果幂等，相反
+  结果或在未到期 open 上记录抛出 ConnectionStateError；参数类型错误
+  抛出 TypeError，负时间抛出 ValueError，未知 id 抛出 KeyError，时间
+  回退抛出 ConnectionStateError。返回键序为 backend_id、state、changed、
+  failures、open_until、reason；任何失败不改变时钟或状态，记录平均
+  O(1)。``select(key, now)`` 沿用一致性哈希的 key 校验与评分，只比较
+  健康且 closed 的后端，并允许到期后端的一次 half_open 探测，选中半开
+  后端即占用探测、记录结果前不再参与选择；没有健康后端抛出
+  NoAvailableBackendError，有健康后端但全部熔断或探测占用时抛出可导入
+  的 CircuitOpenError。``explain(key, now)`` 返回 policy、key、
+  candidates、selected、outcome、reason 固定键序的隔离字典，候选项含
+  backend_id、healthy、state、open_until、probe_in_flight、score，不
+  推进时间或占用探测并与随后 select 一致。状态 O(n)，选择与解释最坏
+  O(n)。
 * ``ConnectionTable(pool, idle_timeout, hard_timeout)``：以五元组标识连接、
   绑定后端池的连接生命周期表。时间只由显式 ``now`` 驱动；按五元组定位、
   记录活动与关闭平均 O(1) 时间，``advance`` 与完整查询 O(n) 时间，
@@ -162,6 +184,7 @@ __all__ = [
     "BackendOverloadedError",
     "ConnectionStateError",
     "RetryExhaustedError",
+    "CircuitOpenError",
     "BackendPool",
     "RoundRobinScheduler",
     "WeightedRoundRobinScheduler",
@@ -211,6 +234,10 @@ class ConnectionStateError(Exception):
 
 class RetryExhaustedError(Exception):
     """重试链达到尝试上限，或当前健康后端均已在本链失败。"""
+
+
+class CircuitOpenError(Exception):
+    """存在健康后端，但它们的熔断器全部开启或半开探测已被占用。"""
 
 
 def _validate_configs(configs):
@@ -1963,6 +1990,387 @@ class RetryChainScheduler:
             "policy": "retry_chain",
             "key": key,
             "failed_backend_ids": list(failed_backend_ids),
+            "candidates": candidates,
+            "selected": selected,
+            "outcome": outcome,
+            "reason": reason,
+        }
+
+
+class CircuitBreakerScheduler:
+    """按后端维护 closed/open/half_open 状态的熔断器调度器（库接口）。
+
+    仅作库接口，不接入 schedule：不改写共享池的健康标记，也不影响
+    绑定同一池的其他调度器。时间只由调用方显式传入的 now 驱动，不读
+    墙上时钟；now 必须是非布尔的非负整数且全局单调不减。
+
+    每个后端独立维护 closed、open、half_open 三种状态与连续失败计数：
+    closed 下成功清零计数，连续失败达到 failure_threshold 时转为 open，
+    open_until 为触发时刻加 reset_timeout；open 到期后下一次记录允许
+    进入 half_open 做一次探测，探测成功则关闭并清零，探测失败则以
+    now 为基准重新打开。同一后端在同一 now 的相同结果幂等返回，相反
+    结果属于状态冲突；任何失败都不改变时钟或熔断器状态。
+
+    select 沿用一致性哈希的 key 校验与评分，只比较健康且 closed 的后端，
+    并允许每个到期后端一次 half_open 探测：选中半开后端即占用探测，在
+    record_result 记录探测结果前该后端不再参与选择。池中没有任何健康
+    后端时抛出 NoAvailableBackendError；存在健康后端但全部熔断或探测
+    被占用时抛出 CircuitOpenError。explain 不推进时间或占用探测，并与
+    紧随其后的 select 选中同一后端。
+
+    相同输入序列结果确定；状态空间 O(n)，记录平均 O(1)，选择与解释
+    最坏 O(n) 时间。
+    """
+
+    def __init__(self, pool, failure_threshold, reset_timeout):
+        # 先完成全部校验，再建立任何实例状态；校验失败时对象不会被
+        # 部分构造。
+        if not isinstance(pool, BackendPool):
+            raise TypeError("pool must be a BackendPool instance")
+        for name, value in (
+            ("failure_threshold", failure_threshold),
+            ("reset_timeout", reset_timeout),
+        ):
+            # bool 是 int 的子类，阈值必须显式排除布尔值。
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ConfigurationError(
+                    f"{name} must be a positive integer"
+                )
+        self._pool = pool
+        self._failure_threshold = failure_threshold
+        self._reset_timeout = reset_timeout
+        self._now = None
+        # 每个后端的熔断状态，按声明顺序平行于 pool._backends。
+        self._entries = [
+            {
+                "state": "closed",
+                "failures": 0,
+                "open_until": None,
+                "probe_in_flight": False,
+                "last_now": None,
+                "last_success": None,
+                "last_result": None,
+            }
+            for _backend in pool._backends
+        ]
+
+    def _validate_event(self, backend_id, success, now):
+        """校验一次结果记录事件，返回后端在声明顺序中的位置。
+
+        校验顺序与 record_result 完全一致：backend_id 非字符串、success
+        非布尔或 now 类型错误抛出 TypeError，负 now 抛出 ValueError，
+        未知 id 抛出 KeyError，全局时间回退抛出 ConnectionStateError。
+        """
+        if not isinstance(backend_id, str):
+            raise TypeError("backend id must be a string")
+        if not isinstance(success, bool):
+            raise TypeError("success must be a boolean")
+        # bool 是 int 的子类，时间戳必须显式排除布尔值。
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be an integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        index = self._pool._index.get(backend_id)
+        if index is None:
+            raise KeyError(backend_id)
+        if self._now is not None and now < self._now:
+            raise ConnectionStateError("now must not move backwards")
+        return index
+
+    def _project(self, entry, success, now):
+        """按记录规则纯计算事件后的状态、计数、open_until、变化与原因。
+
+        不修改任何状态。changed 只在熔断器状态发生转移时为 True，沿用
+        HealthCheckTracker 的约定：closed 下计数增减但状态不变时 changed
+        为 False。closed 成功清零计数；closed 连续失败达到阈值时转为
+        open 并设置 open_until；open 到期（open_until <= now）后进入
+        half_open 探测：探测成功关闭并清零，探测失败重新打开；未到期
+        open 不允许记录结果。half_open 只接受一次探测结果。
+        返回 (state, failures, open_until, changed, reason)。
+        """
+        state = entry["state"]
+        failures = entry["failures"]
+        open_until = entry["open_until"]
+        if state == "closed":
+            if success:
+                return "closed", 0, None, False, "success_recorded"
+            new_failures = failures + 1
+            if new_failures >= self._failure_threshold:
+                return (
+                    "open",
+                    new_failures,
+                    now + self._reset_timeout,
+                    True,
+                    "failure_threshold_reached",
+                )
+            return (
+                "closed",
+                new_failures,
+                None,
+                False,
+                "failure_recorded",
+            )
+        if state == "open":
+            # 只有到期后的 open 才允许记录：到期即进入 half_open 探测，
+            # 再按本次探测结果转移。未到期记录属于状态冲突。
+            if open_until > now:
+                raise ConnectionStateError(
+                    "cannot record a result while the circuit is open"
+                )
+            if success:
+                return "closed", 0, None, True, "probe_succeeded"
+            # 探测失败：以 now 为基准重新打开；失败计数保持阈值，熔断
+            # 期间不再累计 closed 阶段的连续失败。
+            return (
+                "open",
+                failures,
+                now + self._reset_timeout,
+                True,
+                "probe_failed",
+            )
+        # half_open：探测结果决定关闭还是重新打开。
+        if success:
+            return "closed", 0, None, True, "probe_succeeded"
+        return (
+            "open",
+            failures,
+            now + self._reset_timeout,
+            True,
+            "probe_failed",
+        )
+
+    def record_result(self, backend_id, success, now):
+        """记录一次请求结果并推进对应后端的熔断状态。
+
+        结果是键序固定为 backend_id、state、changed、failures、
+        open_until、reason 的隔离新字典。backend_id 非字符串、success
+        非布尔或 now 类型错误抛出 TypeError，负 now 抛出 ValueError，
+        未知 id 抛出 KeyError，全局时间回退或状态冲突（熔断器 open
+        未到期却记录结果等）抛出 ConnectionStateError。同一后端在同一
+        now 提交相同结果幂等返回上次结果的副本；同一 now 的相反结果
+        抛出 ConnectionStateError。任何失败都不改变时钟或状态。closed
+        成功清零计数，连续失败达到 failure_threshold 时转为 open 且
+        open_until 为 now + reset_timeout；到期后转为 half_open，探测
+        成功关闭并清零，探测失败以 now 为基准重新打开。
+        """
+        index = self._validate_event(backend_id, success, now)
+
+        entry = self._entries[index]
+        if entry["last_now"] is not None and now == entry["last_now"]:
+            if success != entry["last_success"]:
+                raise ConnectionStateError(
+                    f"conflicting result for backend {backend_id!r} "
+                    f"at now={now}"
+                )
+            return dict(entry["last_result"])
+
+        new_state, new_failures, new_open_until, changed, reason = (
+            self._project(entry, success, now)
+        )
+
+        # 全部校验与判定完成后才一次性提交状态并推进共享时钟。
+        entry["state"] = new_state
+        entry["failures"] = new_failures
+        entry["open_until"] = new_open_until
+        # 记录落盘后该后端不再有在途探测（open→到期 half_open 的记录即
+        # 探测结果；half_open 记录后关闭或重开）。
+        entry["probe_in_flight"] = False
+        result = {
+            "backend_id": backend_id,
+            "state": new_state,
+            "changed": changed,
+            "failures": new_failures,
+            "open_until": new_open_until,
+            "reason": reason,
+        }
+        entry["last_now"] = now
+        entry["last_success"] = success
+        entry["last_result"] = result
+        self._now = now
+        return dict(result)
+
+    def _effective_state(self, entry, now):
+        """返回仅由时间流逝得到的有效状态，不修改存储状态。
+
+        open 且 open_until <= now 时视为 half_open；其余状态原样返回。
+        """
+        if (
+            entry["state"] == "open"
+            and entry["open_until"] is not None
+            and entry["open_until"] <= now
+        ):
+            return "half_open"
+        return entry["state"]
+
+    def _score(self, key, backend_id):
+        """一致性哈希评分：[key, backend_id] 紧凑 JSON 的 SHA-256 整数。"""
+        payload = json.dumps(
+            [key, backend_id],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return int.from_bytes(
+            hashlib.sha256(payload).digest(), "big", signed=False
+        )
+
+    def _evaluate(self, key, now):
+        """扫描全部后端，返回候选视图与选择结论，不修改任何状态。
+
+        返回 (candidates, chosen, saw_healthy, saw_available)：
+        candidates 为按声明顺序的候选视图字典；chosen 为选中位置，-1
+        表示无选中；saw_healthy 区分“没有任何健康后端”，saw_available
+        表示存在健康但熔断/探测占用之外的可选后端。只比较健康后端：
+        closed 直接可选，到期 open（有效 half_open）在探测未被占用时
+        允许一次探测，二者统一按一致性哈希评分取最高，同分取声明顺序
+        最前者。
+        """
+        backends = self._pool._backends
+        entries = self._entries
+        candidates = []
+        chosen = -1
+        best_score = -1
+        saw_healthy = False
+        saw_available = False
+        for index, backend in enumerate(backends):
+            entry = entries[index]
+            effective = self._effective_state(entry, now)
+            healthy = backend["healthy"]
+            probe_in_flight = entry["probe_in_flight"]
+            candidates.append(
+                {
+                    "backend_id": backend["id"],
+                    "healthy": healthy,
+                    "state": effective,
+                    "open_until": entry["open_until"],
+                    "probe_in_flight": probe_in_flight,
+                    "score": None,
+                }
+            )
+            if not healthy:
+                continue
+            saw_healthy = True
+            if effective == "closed":
+                eligible = True
+            elif effective == "half_open" and not probe_in_flight:
+                eligible = True
+            else:
+                eligible = False
+            if not eligible:
+                continue
+            saw_available = True
+            score = self._score(key, backend["id"])
+            candidates[index]["score"] = f"{score:064x}"
+            # 只在严格更大时替换，摘要相同保留声明顺序最前者。
+            if score > best_score:
+                best_score = score
+                chosen = index
+        return candidates, chosen, saw_healthy, saw_available
+
+    def _validate_select(self, key, now):
+        """校验 select/explain 的 key 与 now，返回后端声明顺序位置表。"""
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        if key == "":
+            raise ValueError("key must be a non-empty string")
+        # bool 是 int 的子类，时间戳必须显式排除布尔值。
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be an integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        if self._now is not None and now < self._now:
+            raise ConnectionStateError("now must not move backwards")
+
+    def select(self, key, now):
+        """按 key 在健康且未熔断的后端中一致性哈希选择一个后端。
+
+        只比较当前健康且 closed 的后端，并允许到期后端（有效
+        half_open）的一次探测：选中半开后端时占用探测，在
+        record_result 记录探测结果前该后端不再参与选择。key 沿用
+        一致性哈希校验（非字符串 TypeError、空字符串 ValueError）；
+        now 必须是非布尔非负整数且不得回退（TypeError/ValueError/
+        ConnectionStateError）。池中没有任何健康后端时抛出
+        NoAvailableBackendError；存在健康后端但全部处于 open 或半开
+        探测已被占用时抛出 CircuitOpenError，两种失败都不推进时钟、
+        不占用探测或改变任何状态。成功选择推进共享时钟到 now 但不改变
+        熔断状态；选中 closed 后端时返回结果，选中 half_open 后端时
+        额外占用其探测。结果是键序固定为 id、address、port 的新字典。
+        单次选择最坏 O(n) 时间、O(1) 额外空间。
+        """
+        self._validate_select(key, now)
+        candidates, chosen, saw_healthy, saw_available = self._evaluate(
+            key, now
+        )
+        if chosen < 0:
+            if not saw_healthy:
+                raise NoAvailableBackendError("no healthy backend available")
+            raise CircuitOpenError(
+                "all healthy backends are circuit-open or probe-occupied"
+            )
+        backend = self._pool._backends[chosen]
+        entry = self._entries[chosen]
+        effective = self._effective_state(entry, now)
+        # 全部判定完成后才占用探测并推进时钟；explain 不做这一步。
+        if effective == "half_open":
+            entry["probe_in_flight"] = True
+        self._now = now
+        return {
+            "id": backend["id"],
+            "address": backend["address"],
+            "port": backend["port"],
+        }
+
+    def explain(self, key, now):
+        """返回一次熔断选择的可重放解释，不推进时间或占用探测。
+
+        与 select 采用完全相同的 key、now 校验与评分规则，校验失败
+        抛出同样的异常，但没有可选后端时不抛出选择异常。结果是键序
+        固定为 policy、key、candidates、selected、outcome、reason 的
+        隔离新字典：policy 固定为 circuit_breaker；candidates 按后端
+        声明顺序排列，每项键序固定为 backend_id、healthy、state、
+        open_until、probe_in_flight、score，state 为考虑到期后的有效
+        状态（open 到期显示 half_open），健康且可选后端的 score 为
+        保留前导零的 64 位小写十六进制 SHA-256 摘要，其余后端 score
+        为 None。存在可选后端时 selected 是键序固定为 id、address、
+        port 的新字典，与紧随其后的 select 逐字段一致，outcome 为
+        selected，选中 closed 时 reason 为 highest_score，选中到期
+        half_open 时 reason 为 half_open_probe；没有健康后端时
+        selected 为 None、outcome 为 failed、reason 为
+        no_healthy_backend；存在健康后端但全部熔断或探测占用时 reason
+        为 all_healthy_backends_circuit_open。解释不推进时钟、不占用
+        探测或改变任何状态；池与熔断状态不变时重复解释逐字段一致。
+        单次查询最坏 O(n) 时间与 O(n) 返回空间。
+        """
+        self._validate_select(key, now)
+        candidates, chosen, saw_healthy, saw_available = self._evaluate(
+            key, now
+        )
+        if chosen < 0:
+            selected = None
+            outcome = "failed"
+            if not saw_healthy:
+                reason = "no_healthy_backend"
+            else:
+                reason = "all_healthy_backends_circuit_open"
+        else:
+            backend = self._pool._backends[chosen]
+            selected = {
+                "id": backend["id"],
+                "address": backend["address"],
+                "port": backend["port"],
+            }
+            outcome = "selected"
+            effective = self._effective_state(self._entries[chosen], now)
+            if effective == "half_open":
+                reason = "half_open_probe"
+            else:
+                reason = "highest_score"
+        return {
+            "policy": "circuit_breaker",
+            "key": key,
             "candidates": candidates,
             "selected": selected,
             "outcome": outcome,
