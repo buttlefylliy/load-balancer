@@ -85,7 +85,19 @@
   单调时钟，回退抛出 ConnectionStateError；类型和值错误、未知后端或
   无连接可释放均在完整校验后抛出，不改变时钟、队列或计数。选择与释放
   后分配最坏 O(n)，入队与逐项过期摊销 O(1)，查询 O(q)，状态空间
-  O(n+max_queue)。
+  O(n+max_queue)。``statistics()`` 返回键序固定为 policy、
+  submissions、outcomes、failures、expired、queue_depth、backends 的
+  累计统计隔离副本：policy 为 queued_least_connections，计数从零
+  开始，queue_depth 为当前等待数。request_id 与 now 通过既有校验的
+  每次 submit 都增加 submissions，立即选中增加 selected，首次入队
+  增加 queued，等待中的同名请求幂等提交只增加 repeated；无健康后端
+  与队列已满的失败分别增加 failures 中的 no_healthy_backend、
+  queue_full。release_and_dispatch 成功增加 released，同时分配队首
+  请求时再增加 dispatched 与 selected；三个写入口清理的每个到期请求
+  恰好增加一次 expired。backends 按池声明顺序排列，每项键序为
+  backend_id、selected、released、active_connections。statistics、
+  pending、explain、健康变更与热加载不累计或清零统计，摘除与恢复保留
+  历史，多实例互不影响；写操作只增加 O(1) 计数开销，完整查询 O(n)。
 * ``ConsistentHashScheduler(pool)``：一致性哈希调度器，``select(key)``
   按会话键对当前健康后端评分（SHA-256 摘要取无符号大端整数，分数最大者
   胜出），不维护游标、连接计数或按键增长的缓存，单次选择最坏 O(n) 时间、
@@ -1170,9 +1182,19 @@ class QueuedLeastConnectionsScheduler:
     套类型、取值与单调校验，但只在只读视图中做虚拟清理，不推进时钟、
     不离队、不改计数。
 
+    ``statistics()`` 返回构造以来累计的提交、释放后分配与到期统计：
+    request_id 与 now 通过既有校验的每次 submit 都计入 submissions，
+    立即选中计入 selected，首次入队计入 queued，等待中的同名请求幂等
+    提交只计入 repeated；无健康后端或队列已满的失败分别计入 failures
+    中的 no_healthy_backend、queue_full。release_and_dispatch 成功计入
+    released，同时分配队首请求时再计入 dispatched 与 selected；三个写
+    入口清理的每个到期请求恰好计入一次 expired。pending、explain、
+    statistics、健康变更与热加载均不累计或清零统计，摘除与恢复保留
+    历史。
+
     选择与释放后分配最坏 O(n) 时间，入队与逐项过期摊销 O(1)，查询
-    O(q)，explain 为 O(n+q)；状态空间 O(n+max_queue)，q 为当前队列
-    长度。
+    O(q)，explain 为 O(n+q)，写操作只增加 O(1) 统计开销，完整统计查询
+    O(n)；状态空间 O(n+max_queue)，q 为当前队列长度。
     """
 
     def __init__(self, pool, max_queue, queue_timeout):
@@ -1205,6 +1227,24 @@ class QueuedLeastConnectionsScheduler:
         # 时同步删除。
         self._results = {}
         self._now = None
+        # 累计统计与活动计数平行保存，按声明顺序排列；统计只增不减，
+        # pending、explain、statistics 与健康/配置变化都不触碰这些值，
+        # 额外空间 O(n)。
+        self._stats_submissions = 0
+        self._stats_expired = 0
+        self._stats_outcomes = {
+            "selected": 0,
+            "queued": 0,
+            "repeated": 0,
+            "released": 0,
+            "dispatched": 0,
+        }
+        self._stats_failures = {
+            "no_healthy_backend": 0,
+            "queue_full": 0,
+        }
+        self._stats_selected = [0] * len(pool._backends)
+        self._stats_released_by_backend = [0] * len(pool._backends)
 
     def _validate_now(self, now):
         """校验共享时间入口：非布尔非负整数且不得回退。"""
@@ -1219,13 +1259,15 @@ class QueuedLeastConnectionsScheduler:
         """移除所有截止时间不晚于 now 的等待请求，摊销 O(1)/项。
 
         到期项按入队顺序从队首弹出；健康变化或分配造成的非队首到期不
-        影响 FIFO 顺序，后续入口在更大或相同的 now 继续清理。
+        影响 FIFO 顺序，后续入口在更大或相同的 now 继续清理。每个清理的
+        到期请求恰好增加一次 expired 累计。
         """
         queue = self._queue
         while queue and queue[0][2] <= now:
             request_id, _queued_at, _expires_at = queue.popleft()
             del self._waiting[request_id]
             del self._results[request_id]
+            self._stats_expired += 1
 
     def _choose_backend(self):
         """沿用最少连接规则选择健康且未满的后端声明位置。
@@ -1270,16 +1312,23 @@ class QueuedLeastConnectionsScheduler:
         self._validate_now(now)
 
         self._now = now
+        # request_id 与 now 通过既有校验的每次提交都计入 submissions，
+        # 包括随后因无健康后端或队列已满而抛出失败异常的调用。
+        self._stats_submissions += 1
         self._purge_expired(now)
 
         # 幂等：同一标识仍在等待时原样返回其入队结果，不推进时钟以外的
-        # 任何状态（时钟已校验为非回退，前进到 now 不改变等待语义）。
+        # 任何状态（时钟已校验为非回退，前进到 now 不改变等待语义）；
+        # 等待中的同名请求只增加 repeated，不重复入队或改计数。
         if request_id in self._waiting:
+            self._stats_outcomes["repeated"] += 1
             return dict(self._results[request_id])
 
         chosen, saw_healthy = self._choose_backend()
         if chosen >= 0:
             self._counts[chosen] += 1
+            self._stats_outcomes["selected"] += 1
+            self._stats_selected[chosen] += 1
             return {
                 "request_id": request_id,
                 "outcome": "selected",
@@ -1289,8 +1338,10 @@ class QueuedLeastConnectionsScheduler:
                 "reason": "least_connections",
             }
         if not saw_healthy:
+            self._stats_failures["no_healthy_backend"] += 1
             raise NoAvailableBackendError("no healthy backend available")
         if len(self._queue) >= self._max_queue:
+            self._stats_failures["queue_full"] += 1
             raise BackendOverloadedError(
                 "all healthy backends are at capacity and queue is full"
             )
@@ -1306,6 +1357,7 @@ class QueuedLeastConnectionsScheduler:
             "reason": "all_healthy_backends_at_capacity",
         }
         self._results[request_id] = result
+        self._stats_outcomes["queued"] += 1
         return dict(result)
 
     def release_and_dispatch(self, backend_id, now):
@@ -1336,6 +1388,8 @@ class QueuedLeastConnectionsScheduler:
 
         # 全部校验完成：先释放并推进时钟，再做到期清理与队首分配。
         self._counts[index] -= 1
+        self._stats_outcomes["released"] += 1
+        self._stats_released_by_backend[index] += 1
         self._now = now
         self._purge_expired(now)
 
@@ -1347,6 +1401,11 @@ class QueuedLeastConnectionsScheduler:
                 del self._waiting[request_id]
                 del self._results[request_id]
                 self._counts[chosen] += 1
+                # 释放后同时把队首请求分配给接收后端：dispatched 与
+                # selected（全局 outcomes 与该后端各一次）一并累计。
+                self._stats_outcomes["dispatched"] += 1
+                self._stats_outcomes["selected"] += 1
+                self._stats_selected[chosen] += 1
                 dispatched = {
                     "request_id": request_id,
                     "backend": self._pool._backends[chosen]["id"],
@@ -1376,6 +1435,8 @@ class QueuedLeastConnectionsScheduler:
             request_id, queued_at, expires_at = queue.popleft()
             del self._waiting[request_id]
             del self._results[request_id]
+            # 每个由 advance 清理的到期请求同样恰好增加一次 expired。
+            self._stats_expired += 1
             expired.append(
                 {
                     "request_id": request_id,
@@ -1400,6 +1461,65 @@ class QueuedLeastConnectionsScheduler:
             }
             for request_id, queued_at, expires_at in self._queue
         ]
+
+    def statistics(self):
+        """返回构造以来累计的提交、释放后分配与到期统计的隔离副本。
+
+        结果是键序固定为 policy、submissions、outcomes、failures、
+        expired、queue_depth、backends 的新字典：policy 固定为
+        queued_least_connections；submissions 与 expired 为从零开始的
+        非负整数累计计数；outcomes 是键序固定为 selected、queued、
+        repeated、released、dispatched 的新字典；failures 是键序固定为
+        no_healthy_backend、queue_full 的新字典；queue_depth 为当前等待
+        请求数（实时队列长度）；backends 按池声明顺序排列，每项键序固定
+        为 backend_id、selected、released、active_connections。
+
+        request_id 与 now 通过既有校验的每次 submit 都增加 submissions：
+        立即选中增加 selected 与接收后端的 selected；首次入队增加
+        queued；等待中的同名请求幂等提交只增加 repeated。无健康后端抛出
+        NoAvailableBackendError 时增加 failures 中的
+        no_healthy_backend，队列已满抛出 BackendOverloadedError 时增加
+        failures 中的 queue_full。release_and_dispatch 成功增加
+        released 与指定后端的 released；若同时把队首请求分配给接收后端，
+        再增加 dispatched、selected 与该后端的 selected。三个写入口
+        （submit、release_and_dispatch、advance）清理的每个到期请求恰好
+        增加一次 expired。参数或时间校验失败、未知后端及无连接可释放均
+        不改变统计；pending、explain、statistics、健康标记变化与配置
+        热加载都不累计或清零统计，摘除与恢复保留历史，多个实例互不影响。
+        返回字典与列表全部为新建对象，修改它们不污染内部状态或后续结果；
+        状态不变时重复调用逐字段相同，active_connections 始终反映实时
+        计数。写操作只增加 O(1) 统计开销，完整查询 O(n) 时间与 O(n)
+        返回空间。
+        """
+        backends = self._pool._backends
+        counts = self._counts
+        return {
+            "policy": "queued_least_connections",
+            "submissions": self._stats_submissions,
+            "outcomes": {
+                "selected": self._stats_outcomes["selected"],
+                "queued": self._stats_outcomes["queued"],
+                "repeated": self._stats_outcomes["repeated"],
+                "released": self._stats_outcomes["released"],
+                "dispatched": self._stats_outcomes["dispatched"],
+            },
+            "failures": {
+                "no_healthy_backend":
+                    self._stats_failures["no_healthy_backend"],
+                "queue_full": self._stats_failures["queue_full"],
+            },
+            "expired": self._stats_expired,
+            "queue_depth": len(self._queue),
+            "backends": [
+                {
+                    "backend_id": backend["id"],
+                    "selected": self._stats_selected[index],
+                    "released": self._stats_released_by_backend[index],
+                    "active_connections": counts[index],
+                }
+                for index, backend in enumerate(backends)
+            ],
+        }
 
     def explain(self, request_id, now):
         """按 submit 的规则只读预览下一次提交，不改变任何状态。
