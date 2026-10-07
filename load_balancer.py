@@ -168,6 +168,22 @@
   任一失败不留下部分修改；成功时按输入顺序返回与 record_result
   相同键序的结果列表，k 个条目使用 O(k) 时间与 O(k) 暂存及返回
    空间。
+* ``HealthCheckTracker.export_log()`` / 类级入口
+  ``HealthCheckTracker.replay_log(pool, failure_threshold,
+  recovery_threshold, stale_timeout, text)``：确定性的内存事件
+  日志与重建入口。record_result、record_batch、advance 每次成功
+  返回后按调用顺序追加一个事件（幂等重复、无状态变化的推进与整批
+  全部幂等的批次也各记录一次，抛出异常的调用不记录）；导出入口
+  返回无末尾换行的紧凑 JSON 数组，事件键序固定为 sequence、
+  operation、now、payload，单条结果与批量结果的 payload 只含
+  backend_id、success（批量值按输入顺序保存），advance 的
+  payload 为 null；重放入口先完成整份文本的解析与结构校验，再以
+  传入池重放前的健康标记为起点在新跟踪器上按 sequence 顺序执行，
+  文本非字符串抛出 TypeError，日志结构非法或事件在给定池、阈值与
+  超时下无法合法执行时统一抛出 ConfigurationError，失败逐位还原
+  池健康标记且不暴露部分结果。单次追加 O(1) 时间与空间，导出
+  O(e)，重放除 advance 的既有扫描成本外状态空间 O(e+n)，e 为
+  事件数、n 为后端数，全程不读墙上时钟。
 * ``CircuitBreakerScheduler(pool, failure_threshold, reset_timeout)``：
   按后端维护 closed、open、half_open 熔断状态与连续失败计数的调度器
   （库接口，不接入 schedule），failure_threshold 与 reset_timeout 必须是
@@ -2889,6 +2905,118 @@ class ConnectionTable:
         return table
 
 
+_HEALTH_EVENT_FIELDS = ("sequence", "operation", "now", "payload")
+_HEALTH_EVENT_OPERATIONS = ("record_result", "record_batch", "advance")
+
+
+def _validate_health_payload(payload, position, operation):
+    """校验健康检查日志事件的 payload，返回规范化后的执行参数。
+
+    record_result 的 payload 为仅含 backend_id、success 的对象；
+    record_batch 的 payload 为非空的同结构对象数组（按输入顺序，
+    重复 id 在结构校验阶段允许，执行时沿用 record_batch 的既有
+    规则判定）；advance 的 payload 必须为 null。任何结构问题统一
+    抛出 ConfigurationError，不修改调用方对象。
+    """
+    location = f"event at position {position}"
+
+    def validate_entry(entry, entry_location):
+        if not isinstance(entry, dict):
+            raise ConfigurationError(
+                f"{entry_location}: expected an object"
+            )
+        unknown = [key for key in entry if key not in ("backend_id", "success")]
+        if unknown:
+            raise ConfigurationError(
+                f"{entry_location}: unknown field {unknown[0]!r}"
+            )
+        missing = [key for key in ("backend_id", "success") if key not in entry]
+        if missing:
+            raise ConfigurationError(
+                f"{entry_location}: missing field {missing[0]!r}"
+            )
+        backend_id = entry["backend_id"]
+        if not isinstance(backend_id, str):
+            raise ConfigurationError(
+                f"{entry_location}: backend_id must be a string"
+            )
+        success = entry["success"]
+        if not isinstance(success, bool):
+            raise ConfigurationError(
+                f"{entry_location}: success must be a boolean"
+            )
+        return {"backend_id": backend_id, "success": success}
+
+    if operation == "advance":
+        if payload is not None:
+            raise ConfigurationError(
+                f"{location}: advance requires a null payload"
+            )
+        return None
+    if operation == "record_result":
+        if not isinstance(payload, dict):
+            raise ConfigurationError(
+                f"{location}: payload must be an object"
+            )
+        return validate_entry(payload, location)
+    if not isinstance(payload, list) or not payload:
+        raise ConfigurationError(
+            f"{location}: payload must be a non-empty array"
+        )
+    return [
+        validate_entry(entry, f"{location} payload at position {entry_position}")
+        for entry_position, entry in enumerate(payload)
+    ]
+
+
+def _validate_health_log_event(event, position):
+    """校验单条健康检查日志事件的结构，返回规范化执行参数元组。
+
+    任何结构问题（事件不是对象、未知或缺失字段、类型错误、序号不从
+    零连续递增、未知 operation、payload 不合规）都统一抛出
+    ConfigurationError；不会修改调用方对象。返回
+    (operation, now, payload)，其中 payload 为规范化新对象/列表或
+    None（advance）。
+    """
+    location = f"event at position {position}"
+    if not isinstance(event, dict):
+        raise ConfigurationError(f"{location}: expected an object")
+    unknown = [key for key in event if key not in _HEALTH_EVENT_FIELDS]
+    if unknown:
+        raise ConfigurationError(f"{location}: unknown field {unknown[0]!r}")
+    missing = [key for key in _HEALTH_EVENT_FIELDS if key not in event]
+    if missing:
+        raise ConfigurationError(f"{location}: missing field {missing[0]!r}")
+
+    sequence = event["sequence"]
+    # bool 是 int 的子类，序号必须显式排除布尔值。
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        raise ConfigurationError(f"{location}: sequence must be an integer")
+    if sequence != position:
+        raise ConfigurationError(
+            f"{location}: sequence must increase contiguously from zero"
+        )
+
+    operation = event["operation"]
+    if not isinstance(operation, str) or operation not in _HEALTH_EVENT_OPERATIONS:
+        raise ConfigurationError(
+            f"{location}: operation must be one of "
+            f"{_HEALTH_EVENT_OPERATIONS!r}"
+        )
+
+    now = event["now"]
+    # bool 是 int 的子类，时间戳必须显式排除布尔值。
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise ConfigurationError(f"{location}: now must be an integer")
+    if now < 0:
+        raise ConfigurationError(
+            f"{location}: now must be a non-negative integer"
+        )
+
+    payload = _validate_health_payload(event["payload"], position, operation)
+    return operation, now, payload
+
+
 class HealthCheckTracker:
     """只消费显式检查结果、在共享池中自动摘除与回切后端的跟踪器。
 
@@ -2918,6 +3046,18 @@ class HealthCheckTracker:
     ``record_batch`` 在同一事件时刻原子提交一批结果：先完成整批校验
     与判定再一次性提交，任一失败不留下部分修改，k 个条目使用 O(k)
     时间与 O(k) 暂存及返回空间。
+
+    每次 record_result、record_batch 或 advance 成功返回后，按调用
+    顺序向内存事件日志追加一个事件（幂等重复、无状态变化的推进与整批
+    全部幂等的批次也各记录一次；抛出异常的调用不新增或改写日志）。
+    日志不记录 statuses、explain、export_log 与外部 set_healthy：
+    重放以传入池重放前的健康标记为起点，外部健康变更不进日志。
+    ``export_log()`` 把日志导出为无末尾换行的紧凑 JSON 数组；类级
+    入口 ``replay_log(pool, failure_threshold, recovery_threshold,
+    stale_timeout, text)`` 先完成解析与结构校验，再按 sequence 在新
+    跟踪器上重放并返回该跟踪器。单次追加 O(1) 时间与空间，导出
+    O(e)，重放除 advance 的既有扫描成本外状态空间 O(e+n)，e 为事件
+    数、n 为后端数，全程不读墙上时钟。
     """
 
     def __init__(self, pool, failure_threshold, recovery_threshold,
@@ -2966,6 +3106,24 @@ class HealthCheckTracker:
             }
             for backend in pool._backends
         ]
+        # 确定性内存事件日志：只在三个写入口成功返回后追加，元素为
+        # 键序固定的新字典，sequence 从零连续递增。
+        self._events = []
+
+    def _append_event(self, operation, now, payload):
+        """把一次成功写操作追加到内存事件日志，O(1) 时间与空间。
+
+        payload 必须是已经与调用方对象隔离的新对象或 None；事件字典
+        在此再次按固定键序构造，调用方无法通过持有的引用污染日志。
+        """
+        self._events.append(
+            {
+                "sequence": len(self._events),
+                "operation": operation,
+                "now": now,
+                "payload": payload,
+            }
+        )
 
     def _validate_event(self, backend_id, success, now):
         """校验一次检查事件，返回后端在声明顺序中的位置。
@@ -3082,6 +3240,12 @@ class HealthCheckTracker:
                     f"conflicting result for backend {backend_id!r} "
                     f"at now={now}"
                 )
+            # 幂等重复同样记录一次事件；payload 为新建对象。
+            self._append_event(
+                "record_result",
+                now,
+                {"backend_id": backend_id, "success": success},
+            )
             return dict(state["last_result"])
 
         # 外部 set_healthy 造成的状态偏移在下一次记录时被发现：
@@ -3093,6 +3257,11 @@ class HealthCheckTracker:
             index, backend_id, success, now, actual, projection
         )
         self._now = now
+        self._append_event(
+            "record_result",
+            now,
+            {"backend_id": backend_id, "success": success},
+        )
         return result
 
     def record_batch(self, results, now):
@@ -3199,6 +3368,16 @@ class HealthCheckTracker:
                 )
             )
         self._now = now
+        # 整批成功（含整批全部幂等）记录一个事件；payload 按输入顺序
+        # 新建，调用方列表与返回列表都不能污染日志。
+        self._append_event(
+            "record_batch",
+            now,
+            [
+                {"backend_id": backend_id, "success": success}
+                for backend_id, success in prepared
+            ],
+        )
         return committed
 
     def explain(self, backend_id, success, now):
@@ -3277,8 +3456,9 @@ class HealthCheckTracker:
         时间、expired_at 等于本次 now、reason 为
         health_check_timeout；没有变化或未启用超时时返回空列表。
         返回的列表与字典都与内部状态隔离，修改它们不影响后续行为。
-        单次推进最坏 O(n) 时间，除返回列表外只使用 O(1) 额外空间，
-        不保存事件历史。
+        单次推进最坏 O(n) 时间，除返回列表与追加的事件外只使用 O(1)
+        额外空间；成功的推进（含无状态变化的幂等推进）追加一个
+        payload 为 null 的日志事件。
         """
         # bool 是 int 的子类，时间戳必须显式排除布尔值。
         if isinstance(now, bool) or not isinstance(now, int):
@@ -3290,33 +3470,36 @@ class HealthCheckTracker:
         self._now = now
 
         if self._stale_timeout is None:
-            return []
-        removed = []
-        for index, backend in enumerate(self._pool._backends):
-            if not backend["healthy"]:
-                continue
-            state = self._states[index]
-            checked_at = state["checked_at"]
-            if checked_at is None:
-                continue
-            if checked_at + self._stale_timeout > now:
-                continue
-            backend_id = backend["id"]
-            self._pool.set_healthy(backend_id, False)
-            state["known_healthy"] = False
-            state["consecutive_failures"] = 0
-            state["consecutive_successes"] = 0
-            state["changed"] = True
-            removed.append(
-                {
-                    "backend_id": backend_id,
-                    "healthy": False,
-                    "changed": True,
-                    "checked_at": checked_at,
-                    "expired_at": now,
-                    "reason": "health_check_timeout",
-                }
-            )
+            removed = []
+        else:
+            removed = []
+            for index, backend in enumerate(self._pool._backends):
+                if not backend["healthy"]:
+                    continue
+                state = self._states[index]
+                checked_at = state["checked_at"]
+                if checked_at is None:
+                    continue
+                if checked_at + self._stale_timeout > now:
+                    continue
+                backend_id = backend["id"]
+                self._pool.set_healthy(backend_id, False)
+                state["known_healthy"] = False
+                state["consecutive_failures"] = 0
+                state["consecutive_successes"] = 0
+                state["changed"] = True
+                removed.append(
+                    {
+                        "backend_id": backend_id,
+                        "healthy": False,
+                        "changed": True,
+                        "checked_at": checked_at,
+                        "expired_at": now,
+                        "reason": "health_check_timeout",
+                    }
+                )
+        # 无状态变化的推进也记录一次事件。
+        self._append_event("advance", now, None)
         return removed
 
     def statuses(self):
@@ -3340,6 +3523,88 @@ class HealthCheckTracker:
                 }
             )
         return report
+
+    def export_log(self):
+        """把内存事件日志导出为无末尾换行的紧凑 JSON 数组字符串。
+
+        数组按调用顺序排列，每个事件对象的键固定为 sequence、
+        operation、now、payload：sequence 从零连续递增；operation 为
+        record_result、record_batch、advance 之一；record_result 的
+        payload 是键序固定为 backend_id、success 的对象，
+        record_batch 的 payload 是按输入顺序排列的同结构对象数组，
+        advance 的 payload 为 null。日志只记录三个写入口成功返回的
+        调用（含幂等重复、无状态变化的推进与整批全部幂等的批次），
+        不记录 statuses、explain、export_log 与外部 set_healthy。
+        状态不变时重复导出逐字节一致；导出结果为新建字符串，调用方
+        对象与返回内容都不能污染内部日志。O(e) 时间，e 为事件数。
+        """
+        return json.dumps(
+            self._events, separators=(",", ":"), ensure_ascii=False
+        )
+
+    @classmethod
+    def replay_log(cls, pool, failure_threshold, recovery_threshold,
+                   stale_timeout, text):
+        """按事件日志在新 HealthCheckTracker 上重放并返回该跟踪器。
+
+        先完成 text 的解析与全部事件的结构校验，再以传入池重放前的
+        健康标记为起点，在绑定 pool 的新跟踪器上按 sequence 顺序执行。
+        text 非字符串抛出 TypeError；非法 JSON、顶层非数组、字段缺失
+        或多余、序号不从零连续递增、未知 operation、payload 不合规，
+        以及按给定池的初始健康状态、阈值与超时无法合法执行的事件，
+        统一抛出 ConfigurationError。failure_threshold、
+        recovery_threshold 与 stale_timeout 沿用构造函数的既有校验。
+        重放期间事件造成的摘除与回切先在池上执行，任何失败都逐位
+        还原池重放前的健康标记，也不暴露部分结果；对仅经三个写入口
+        变化的原实例，成功跟踪器的 statuses、随后 explain 的结果与
+        再次导出的日志和原实例逐字段、逐字节一致，新事件从下一序号
+        继续。除 advance 的既有扫描成本外，重放状态空间为 O(e+n)，
+        e 为事件数、n 为后端数，全程不读墙上时钟。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        try:
+            events = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(
+                f"invalid JSON: {exc}"
+            ) from None
+        if not isinstance(events, list):
+            raise ConfigurationError("event log must be a JSON array")
+        # 先完成全部事件的结构校验，再建立任何可见状态。
+        prepared = [
+            _validate_health_log_event(event, position)
+            for position, event in enumerate(events)
+        ]
+
+        # 记录池重放前的健康标记：重放期间事件会经既有写入口在共享池
+        # 上摘除或回切后端，任何失败都逐位还原，保证传入池不被改变。
+        original_health = [
+            backend["healthy"] for backend in pool._backends
+        ]
+        tracker = cls(
+            pool, failure_threshold, recovery_threshold, stale_timeout
+        )
+        try:
+            for position, (operation, now, payload) in enumerate(prepared):
+                if operation == "record_result":
+                    tracker.record_result(
+                        payload["backend_id"], payload["success"], now
+                    )
+                elif operation == "record_batch":
+                    tracker.record_batch(
+                        [dict(entry) for entry in payload], now
+                    )
+                else:
+                    tracker.advance(now)
+        except (TypeError, ValueError, KeyError,
+                ConnectionStateError) as exc:
+            for backend, healthy in zip(pool._backends, original_health):
+                backend["healthy"] = healthy
+            raise ConfigurationError(
+                f"event at position {position} cannot be replayed: {exc}"
+            ) from None
+        return tracker
 
 
 class CircuitBreakerScheduler:

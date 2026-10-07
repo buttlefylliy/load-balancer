@@ -139,6 +139,15 @@
 * `replay_log(pool, idle_timeout, hard_timeout, text)` 先完成解析与结构校验，再按 sequence 在新 `ConnectionTable` 上执行。text 非字符串抛出 `TypeError`；非法 JSON、顶层非数组、未知或缺失字段、类型错误、序号不连续、操作与可空字段组合不符，以及按给定池和超时无法合法执行的事件，统一抛出 `ConfigurationError`。失败不修改传入池也不暴露部分结果；成功表的 `connections()`、`active_connections()` 和再次导出的日志与原表逐字段、逐字节一致。
 * 单次追加为 O(1) 时间和空间，导出为 O(e)，重放的状态空间为 O(e+n)，其中 e 为事件数、n 为连接记录数。
 
+## 健康检查事件日志与重放（库接口）
+
+`HealthCheckTracker` 提供确定性的纯内存事件日志与重建入口 `export_log()` 和类级入口 `HealthCheckTracker.replay_log(pool, failure_threshold, recovery_threshold, stale_timeout, text)`，仅作库接口：不接入 `schedule`，不落盘，不读墙上时钟，也不改变既有检查、批量提交、失联摘除、解释查询、共享 `BackendPool` 与命令行行为。
+
+* 每次 `record_result`、`record_batch` 或 `advance` 成功返回后，按调用顺序追加一个事件；幂等重复、无状态变化的推进和整批全部幂等的批次也各记录一次，抛出异常的调用不新增或改写日志。日志不记录 `statuses`、`explain`、`export_log` 与外部 `set_healthy` 调用。
+* `export_log()` 返回无末尾换行的紧凑 JSON 数组，事件键序固定为 sequence、operation、now、payload：sequence 从零连续递增；operation 为 `record_result`、`record_batch`、`advance` 之一；单条结果的 payload 是键序固定为 backend_id、success 的对象，批量结果的 payload 按输入顺序保存同结构对象，advance 的 payload 为 `null`。状态不变时重复导出逐字节一致，调用方对象和返回内容都不能污染内部日志。
+* `replay_log(...)` 先完整解析并校验全部事件，再以传入池重放前的健康标记为起点，在绑定该池的新跟踪器上按 sequence 顺序执行，恢复连续计数、最近检查时间、池健康标记、事件时钟与原日志。对仅经三个写入口变化的原实例，返回对象的 `statuses()`、随后的 `explain()` 与再次导出的内容和原实例逐字段、逐字节一致，新事件从下一序号继续。
+* text 非字符串抛出 `TypeError`；非法 JSON、顶层非数组、字段缺失或多余、序号不连续、未知 operation、payload 不合规，或池的初始状态使事件不能合法执行，统一抛出 `ConfigurationError`。构造参数沿用既有异常；任何失败都逐位还原传入池的健康标记且不暴露部分结果。单次追加为 O(1)，导出为 O(e)；重放除 advance 的既有扫描成本外使用 O(e+n) 空间，e 为事件数、n 为后端数，全程不读墙上时钟。
+
 ## 熔断器调度（库接口）
 
 库接口提供 `CircuitBreakerScheduler(pool, failure_threshold, reset_timeout)` 与 `CircuitOpenError`，均可从 `load_balancer` 直接导入；仅作库接口，不接入 `schedule`，命令的参数、输出、异常类型与退出码保持不变，也不改变任何既有功能。调度器按后端维护各自独立的 closed、open、half_open 熔断状态与连续失败计数，熔断状态只存在于本调度器：不写入共享池的健康标记，不影响绑定同一池的其他调度器、重试链或健康检查跟踪器。
