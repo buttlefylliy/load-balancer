@@ -36,6 +36,8 @@
 * 调度器为池中每个后端维护从零开始的活动连接数；每次选择只考察当前健康且活动连接数低于自身上限的后端（不限量后端始终通过容量筛选），取活动连接数最小者，计数相同时按声明顺序取最前者。选择成功后只把被选后端的计数加一，再返回与轮询调度器相同键序的后端字典。`weight` 仍按既有规则校验，但不参与比较。
 * `schedule` 命令中的 count 次选择视为依次建立且未释放的连接；没有健康后端时仍以退出码 4 结束，存在健康后端但全部达到上限时在 stderr 输出键序为 type、message 的紧凑 JSON（类型 `BackendOverloadedError`、消息 `all healthy backends are at capacity`）并以退出码 5 结束；两种失败都不在 stdout 留下部分结果。`BackendOverloadedError` 可从 `load_balancer` 直接导入。
 * 库接口提供 `release_connection(backend_id)` 与 `active_connections()`：释放成功只把对应计数减一，释放出的空位立即可用于下一次选择；重复释放到零以下抛出 `ConnectionStateError` 且任何计数不变；id 非字符串抛出 `TypeError`，id 不存在抛出 `KeyError`。查询返回与内部状态隔离、按声明顺序排列的新字典。
+* 库接口另提供 `statistics()`（不接入命令行，`schedule` 的参数、输出、异常类型与退出码保持不变）：返回键序固定为 policy、attempts、succeeded、failed、released、failures、backends 的新字典，policy 固定为 `least_connections`，各累计计数从零开始且为非负整数。每次 `select()` 调用增加 attempts：成功时同时增加 succeeded 与被选后端的 selected，活动连接照常加一；没有健康后端仍抛出 `NoAvailableBackendError`、健康后端全部满载仍抛出 `BackendOverloadedError`，两种失败只增加 failed 与 failures 中对应的失败原因（键序为 no_healthy_backend、all_healthy_backends_at_capacity），不改变任何连接数。`release_connection` 成功时增加 released 总数与目标后端的 released 并照常减少活动连接；参数类型错误、未知 id 或从零继续释放仍抛出现有异常，全部统计与连接状态不变。`explain()`、`active_connections()`、`statistics()` 及健康标记变化均不累计任何事件。backends 按池声明顺序排列，每项键序固定为 backend_id、selected、released、active_connections，其中 selected 与 released 为该后端的累计计数，active_connections 沿用现有实时计数；后端摘除或恢复时保留全部累计值。
+* `statistics()` 返回的字典、failures 字典与 backends 列表全部为新建对象，修改它们不污染内部状态或后续结果；状态不变时重复调用逐字段相同。累计状态占用 O(n) 空间，选择与释放只增加 O(1) 统计开销，完整查询使用 O(n) 时间与 O(n) 返回空间；其他调度器不增加任何统计。
 * 健康状态变化立即影响后续选择，但不清除或改写已有计数；不健康的后端仍允许释放既有连接，恢复健康后按保留的计数与上限重新参与比较。
 * 构造为 O(n) 时间与 O(n) 额外空间，单次选择最坏 O(n)、额外空间 O(1)，单次释放 O(1)，计数查询 O(n)，不按容量展开存储。
 
