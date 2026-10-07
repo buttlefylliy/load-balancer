@@ -218,6 +218,23 @@
   抛 CircuitOpenError。``explain(key, now)`` 返回键序固定为 policy、
   key、candidates、selected、outcome、reason 的只读解释，不推进时间或
   占用探测，与随后 select 一致。
+* ``CircuitBreakerScheduler.export_log()`` / 类级入口
+  ``CircuitBreakerScheduler.replay_log(pool, failure_threshold,
+  reset_timeout, text)``：确定性的内存事件日志与重建入口。
+  record_result 每次成功返回（含幂等重复）与 key、now 通过既有校验
+  的每次 select（含 NoAvailableBackendError、CircuitOpenError 两种
+  调度失败）都按调用顺序追加一个事件，校验失败的调用不记录，查询
+  入口不记录；导出入口返回无末尾换行的紧凑 JSON 数组，事件键序固定
+  为 sequence、operation、now、payload，record_result 的 payload
+  依次含 backend_id、success，select 的 payload 依次含 key、
+  outcome、backend_id（outcome 为 selected、no_healthy_backend、
+  all_circuits_open，失败时 backend_id 为 null）；重放入口先完成
+  整份文本的解析与结构校验，再在绑定传入池的新实例上按 sequence
+  依序执行，并核对 select 声明的 outcome 与 backend_id 与实际决策
+  一致，文本非字符串抛出 TypeError，日志结构非法、事件无法执行或
+  结果不匹配统一抛出 ConfigurationError，失败不修改传入池也不暴露
+  部分结果。单次追加 O(1) 时间与空间，导出 O(e)，重放除 select 的
+  既有 O(n) 扫描成本外状态空间为 O(e+n)，e 为事件数、n 为后端数。
 """
 
 import argparse
@@ -3715,6 +3732,128 @@ class HealthCheckTracker:
         return tracker
 
 
+_CIRCUIT_EVENT_FIELDS = ("sequence", "operation", "now", "payload")
+_CIRCUIT_EVENT_OPERATIONS = ("record_result", "select")
+_CIRCUIT_SELECT_OUTCOMES = (
+    "selected",
+    "no_healthy_backend",
+    "all_circuits_open",
+)
+
+
+def _validate_circuit_log_event(event, position):
+    """校验单条熔断调度日志事件的结构，返回规范化执行参数元组。
+
+    任何结构问题（事件不是对象、未知或缺失字段、类型错误、序号不从零
+    连续递增、未知 operation、payload 不合规）都统一抛出
+    ConfigurationError；不会修改调用方对象。返回
+    (operation, now, payload)，payload 为与日志文本隔离的规范化新
+    字典：record_result 依次含 backend_id、success，select 依次含
+    key、outcome、backend_id。
+    """
+    location = f"event at position {position}"
+    if not isinstance(event, dict):
+        raise ConfigurationError(f"{location}: expected an object")
+    unknown = [key for key in event if key not in _CIRCUIT_EVENT_FIELDS]
+    if unknown:
+        raise ConfigurationError(f"{location}: unknown field {unknown[0]!r}")
+    missing = [key for key in _CIRCUIT_EVENT_FIELDS if key not in event]
+    if missing:
+        raise ConfigurationError(f"{location}: missing field {missing[0]!r}")
+
+    sequence = event["sequence"]
+    # bool 是 int 的子类，序号必须显式排除布尔值。
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        raise ConfigurationError(f"{location}: sequence must be an integer")
+    if sequence != position:
+        raise ConfigurationError(
+            f"{location}: sequence must increase contiguously from zero"
+        )
+
+    operation = event["operation"]
+    if not isinstance(operation, str) or (
+        operation not in _CIRCUIT_EVENT_OPERATIONS
+    ):
+        raise ConfigurationError(
+            f"{location}: operation must be one of "
+            f"{_CIRCUIT_EVENT_OPERATIONS!r}"
+        )
+
+    now = event["now"]
+    # bool 是 int 的子类，时间戳必须显式排除布尔值。
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise ConfigurationError(f"{location}: now must be an integer")
+    if now < 0:
+        raise ConfigurationError(
+            f"{location}: now must be a non-negative integer"
+        )
+
+    payload = event["payload"]
+    if not isinstance(payload, dict):
+        raise ConfigurationError(f"{location}: payload must be an object")
+    if operation == "record_result":
+        fields = ("backend_id", "success")
+    else:
+        fields = ("key", "outcome", "backend_id")
+    unknown = [key for key in payload if key not in fields]
+    if unknown:
+        raise ConfigurationError(
+            f"{location}: unknown payload field {unknown[0]!r}"
+        )
+    missing = [key for key in fields if key not in payload]
+    if missing:
+        raise ConfigurationError(
+            f"{location}: missing payload field {missing[0]!r}"
+        )
+
+    if operation == "record_result":
+        backend_id = payload["backend_id"]
+        if not isinstance(backend_id, str):
+            raise ConfigurationError(
+                f"{location}: backend_id must be a string"
+            )
+        success = payload["success"]
+        if not isinstance(success, bool):
+            raise ConfigurationError(
+                f"{location}: success must be a boolean"
+            )
+        return operation, now, {
+            "backend_id": backend_id,
+            "success": success,
+        }
+
+    key = payload["key"]
+    if not isinstance(key, str) or key == "":
+        raise ConfigurationError(
+            f"{location}: key must be a non-empty string"
+        )
+    outcome = payload["outcome"]
+    if not isinstance(outcome, str) or (
+        outcome not in _CIRCUIT_SELECT_OUTCOMES
+    ):
+        raise ConfigurationError(
+            f"{location}: outcome must be one of "
+            f"{_CIRCUIT_SELECT_OUTCOMES!r}"
+        )
+    backend_id = payload["backend_id"]
+    if outcome == "selected":
+        if not isinstance(backend_id, str):
+            raise ConfigurationError(
+                f"{location}: backend_id must be a string when outcome "
+                "is 'selected'"
+            )
+    elif backend_id is not None:
+        raise ConfigurationError(
+            f"{location}: backend_id must be null when outcome is "
+            f"{outcome!r}"
+        )
+    return operation, now, {
+        "key": key,
+        "outcome": outcome,
+        "backend_id": backend_id,
+    }
+
+
 class CircuitBreakerScheduler:
     """按后端维护熔断状态的一致性哈希调度器（库接口，不接入 schedule）。
 
@@ -3751,6 +3890,17 @@ class CircuitBreakerScheduler:
     任何事件，也不清零统计；摘除或恢复后端与熔断状态转换保留全部累计值。
     统计只描述通过本实例发生的 select 调用，不影响共享同一后端池的其他
     调度器实例。记录为 O(1)，选择与解释最坏 O(n)，状态空间 O(n)。
+
+    每次 record_result 成功返回（含同一后端同一 now 的幂等重复）与
+    key、now 通过既有校验的每次 select（无论选中还是抛出
+    NoAvailableBackendError、CircuitOpenError）都按调用顺序向内存事件
+    日志追加一个事件；校验失败的调用不新增或改写日志。日志不记录
+    explain、statistics 与 export_log。``export_log()`` 把日志导出为
+    无末尾换行的紧凑 JSON 数组；类级入口 ``replay_log(pool,
+    failure_threshold, reset_timeout, text)`` 先校验整份文本，再在
+    绑定传入池的新实例上按序重放并核对 select 声明的结果，成功后新
+    实例的熔断状态、连续失败数、open_until、半开探测占用、事件时间、
+    统计与再次导出的日志和原实例一致。
     """
 
     _CLOSED = "closed"
@@ -3803,6 +3953,25 @@ class CircuitBreakerScheduler:
             "all_circuits_open": 0,
         }
         self._stats_selected = [0] * len(pool._backends)
+        # 确定性内存事件日志：只在 record_result 成功返回与 select 通过
+        # key、now 校验后追加，元素为键序固定的新字典，sequence 从零
+        # 连续递增。
+        self._events = []
+
+    def _append_event(self, operation, now, payload):
+        """把一次成功写操作追加到内存事件日志，O(1) 时间与空间。
+
+        payload 必须是已经与调用方对象隔离的新对象；事件字典在此再次
+        按固定键序构造，调用方无法通过持有的引用污染日志。
+        """
+        self._events.append(
+            {
+                "sequence": len(self._events),
+                "operation": operation,
+                "now": now,
+                "payload": payload,
+            }
+        )
 
     def _validate_time(self, now):
         """校验共享时间入口：非布尔非负整数且不得回退。"""
@@ -3843,8 +4012,9 @@ class CircuitBreakerScheduler:
         同一后端同一 now 的相同结果幂等返回上次结果的副本，不重复
         累计；探测结果同时清除探测占用。返回新字典的键序固定为
         backend_id、state、changed、failures、open_until、reason，
-        open_until 在非 open 状态下为 None。单次记录 O(1) 时间与
-        O(1) 额外空间。
+        open_until 在非 open 状态下为 None。每次成功返回（含幂等
+        重复）后向内存事件日志追加一个 record_result 事件，任何失败
+        都不追加。单次记录 O(1) 时间与 O(1) 额外空间。
         """
         if not isinstance(backend_id, str):
             raise TypeError("backend id must be a string")
@@ -3868,6 +4038,12 @@ class CircuitBreakerScheduler:
                     f"conflicting result for backend {backend_id!r} "
                     f"at now={now}"
                 )
+            # 幂等重复也是一次成功返回，同样追加事件。
+            self._append_event(
+                "record_result",
+                now,
+                {"backend_id": backend_id, "success": success},
+            )
             return dict(state["last_result"])
 
         observed = self._effective_state(state, now)
@@ -3932,6 +4108,11 @@ class CircuitBreakerScheduler:
         state["last_now"] = now
         state["last_success"] = success
         state["last_result"] = result
+        self._append_event(
+            "record_result",
+            now,
+            {"backend_id": backend_id, "success": success},
+        )
         return dict(result)
 
     def _plan(self, key, now):
@@ -4026,8 +4207,10 @@ class CircuitBreakerScheduler:
         failures 中的 no_healthy_backend；存在健康后端但全部处于 open
         或探测已占用时抛出 CircuitOpenError，只增加 failed 与
         all_circuits_open：两种失败都不留下后端命中、不推进时钟或改变
-        熔断状态。最坏 O(n) 时间、除固定大小数据外额外 O(n) 用于候选
-        判定（不向外返回），统计更新只增加 O(1) 开销。
+        熔断状态。通过 key 与 now 校验的每次调用（含两种调度失败）都向
+        内存事件日志追加一个 select 事件，校验失败不追加。最坏 O(n)
+        时间、除固定大小数据外额外 O(n) 用于候选判定（不向外返回），
+        统计更新只增加 O(1) 开销。
         """
         if not isinstance(key, str):
             raise TypeError("key must be a string")
@@ -4041,10 +4224,28 @@ class CircuitBreakerScheduler:
         if not saw_healthy:
             self._stats_failed += 1
             self._stats_failures["no_healthy_backend"] += 1
+            self._append_event(
+                "select",
+                now,
+                {
+                    "key": key,
+                    "outcome": "no_healthy_backend",
+                    "backend_id": None,
+                },
+            )
             raise NoAvailableBackendError("no healthy backend available")
         if not has_eligible or chosen < 0:
             self._stats_failed += 1
             self._stats_failures["all_circuits_open"] += 1
+            self._append_event(
+                "select",
+                now,
+                {
+                    "key": key,
+                    "outcome": "all_circuits_open",
+                    "backend_id": None,
+                },
+            )
             raise CircuitOpenError(
                 "all healthy backends have open circuits or probes in flight"
             )
@@ -4060,6 +4261,15 @@ class CircuitBreakerScheduler:
         self._stats_succeeded += 1
         self._stats_selected[chosen] += 1
         backend = self._pool._backends[chosen]
+        self._append_event(
+            "select",
+            now,
+            {
+                "key": key,
+                "outcome": "selected",
+                "backend_id": backend["id"],
+            },
+        )
         return {
             "id": backend["id"],
             "address": backend["address"],
@@ -4170,6 +4380,98 @@ class CircuitBreakerScheduler:
             "outcome": outcome,
             "reason": reason,
         }
+
+    def export_log(self):
+        """把内存事件日志导出为无末尾换行的紧凑 JSON 数组字符串。
+
+        数组按调用顺序排列，每个事件对象的键固定为 sequence、
+        operation、now、payload：sequence 从零连续递增；operation 为
+        record_result、select 之一；record_result 的 payload 是键序
+        固定为 backend_id、success 的对象，select 的 payload 是键序
+        固定为 key、outcome、backend_id 的对象，outcome 为 selected、
+        no_healthy_backend、all_circuits_open 之一，失败时
+        backend_id 为 null。日志只记录 record_result 成功返回（含幂等
+        重复）与 key、now 通过校验的 select 调用（含两种调度失败），
+        不记录 explain、statistics 与 export_log。状态不变时重复导出
+        逐字节一致，非 ASCII 字符不转义；导出结果为新建字符串，调用方
+        对象与返回内容都不能污染内部日志。O(e) 时间，e 为事件数。
+        """
+        return json.dumps(
+            self._events, separators=(",", ":"), ensure_ascii=False
+        )
+
+    @classmethod
+    def replay_log(cls, pool, failure_threshold, reset_timeout, text):
+        """按事件日志在新 CircuitBreakerScheduler 上重放并返回该实例。
+
+        先完成 text 的解析与全部事件的结构校验，再在绑定 pool 的新实例
+        上按 sequence 依序执行：record_result 事件按 payload 记录结果，
+        select 事件按 payload 的 key 与 now 选择，并核对声明的 outcome
+        与 backend_id 和实际决策一致。text 非字符串抛出 TypeError；
+        非法 JSON、顶层非数组、字段缺失或多余、序号不从零连续递增、
+        未知 operation、payload 不合规、事件按给定池与参数无法合法
+        执行，以及 select 声明的结果与实际决策不匹配，统一抛出
+        ConfigurationError。failure_threshold 与 reset_timeout 沿用
+        构造函数的既有校验。熔断状态只存在于实例内部，重放不写入传入
+        池，任何失败都不修改传入池，也不暴露部分结果。成功时新实例的
+        熔断状态、连续失败数、open_until、半开探测占用、事件时间与
+        累计统计全部恢复：statistics、同一 now 下的 explain、再次导出
+        的日志及后续相同调用与原实例逐字段、逐字节一致，新事件从下一
+        序号继续。重放除 select 的既有 O(n) 扫描成本外状态空间为
+        O(e+n)，e 为事件数、n 为后端数，全程不读墙上时钟。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        try:
+            events = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(
+                f"invalid JSON: {exc}"
+            ) from None
+        if not isinstance(events, list):
+            raise ConfigurationError("event log must be a JSON array")
+        # 先完成全部事件的结构校验，再建立任何可见状态。
+        prepared = [
+            _validate_circuit_log_event(event, position)
+            for position, event in enumerate(events)
+        ]
+
+        scheduler = cls(pool, failure_threshold, reset_timeout)
+        for position, (operation, now, payload) in enumerate(prepared):
+            if operation == "record_result":
+                try:
+                    scheduler.record_result(
+                        payload["backend_id"], payload["success"], now
+                    )
+                except (TypeError, ValueError, KeyError,
+                        ConnectionStateError) as exc:
+                    raise ConfigurationError(
+                        f"event at position {position} cannot be "
+                        f"replayed: {exc}"
+                    ) from None
+                continue
+            try:
+                result = scheduler.select(payload["key"], now)
+            except NoAvailableBackendError:
+                actual = ("no_healthy_backend", None)
+            except CircuitOpenError:
+                actual = ("all_circuits_open", None)
+            except (TypeError, ValueError,
+                    ConnectionStateError) as exc:
+                raise ConfigurationError(
+                    f"event at position {position} cannot be "
+                    f"replayed: {exc}"
+                ) from None
+            else:
+                actual = ("selected", result["id"])
+            expected = (payload["outcome"], payload["backend_id"])
+            if actual != expected:
+                raise ConfigurationError(
+                    f"event at position {position} does not match the "
+                    f"declared outcome {expected[0]!r} with backend "
+                    f"{expected[1]!r}"
+                )
+        return scheduler
 
 
 def _positive_int(value):
