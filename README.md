@@ -43,6 +43,20 @@
 * 健康状态变化立即影响后续选择，但不清除或改写已有计数；不健康的后端仍允许释放既有连接，恢复健康后按保留的计数与上限重新参与比较。
 * 构造为 O(n) 时间与 O(n) 额外空间，单次选择最坏 O(n)、额外空间 O(1)，单次释放 O(1)，计数查询 O(n)，不按容量展开存储。
 
+## 带等待队列的最少连接调度（库接口）
+
+库接口提供 `QueuedLeastConnectionsScheduler(pool, max_queue, queue_timeout)`，可从 `load_balancer` 直接导入；仅作库接口，不接入 `schedule`，命令的参数、输出、异常类型与退出码保持不变，也不改变任何既有功能。它为每个后端维护从零开始、与 `LeastConnectionsScheduler` 及 `ConnectionTable` 各自独立的活动连接计数：其他调度器和连接表的行为保持原样，互不影响。
+
+* `pool` 不是 `BackendPool` 时与其他调度器一样抛出 `TypeError`。`max_queue`（等待队列容量）与 `queue_timeout`（等待超时）都必须是排除布尔值的正整数，零、负数、布尔、浮点或其他类型均抛出 `ConfigurationError`。全部校验完成前不建立任何实例状态，构造失败不会产生部分对象。
+* 时间只由调用方显式传入的 `now` 驱动，不读墙上时钟；`submit`、`release_and_dispatch`、`advance` 共享同一条单调时间线。`now` 必须是非布尔的非负整数：类型错误抛出 `TypeError`，负值抛出 `ValueError`，时间回退抛出 `ConnectionStateError`。
+* `submit(request_id, now)` 先按当前 `now` 清理等待队列中截止时间（`queued_at + queue_timeout`）不晚于 `now` 的请求，再沿用现有最少连接规则在当前健康且计数低于自身 `max_connections` 上限的后端中取计数最小者（计数相同取声明顺序最前者）。`request_id` 必须是非空字符串：非字符串抛出 `TypeError`，空字符串抛出 `ValueError`。
+* 选中后端时把对应计数加一，返回键序固定为 request_id、outcome、backend、queued_at、expires_at、reason 的新字典：outcome 为 `selected`，backend 为被选后端 id，queued_at 与 expires_at 为 `null`，reason 为 `least_connections`。
+* 仅当存在健康后端但它们全部满载时，才在队列未满时把请求按先进先出顺序入队，返回 outcome 为 `queued`、backend 为 `null`、queued_at 为 `now`、expires_at 为 `now + queue_timeout`、reason 为 `all_healthy_backends_at_capacity` 的新字典。同一 `request_id` 仍在等待时重复提交幂等返回原结果的副本，不重复入队、不改变队列顺序或计数。池中没有任何健康后端时抛出 `NoAvailableBackendError`；健康后端全部满载且队列已满时抛出 `BackendOverloadedError`。入队为摊销 O(1)，选择为最坏 O(n)，逐项过期摊销 O(1)。
+* `release_and_dispatch(backend_id, now)` 先完整校验再修改状态：backend_id 非字符串抛出 `TypeError`，未知 id 抛出 `KeyError`，该后端计数已为零时抛出 `ConnectionStateError`，`now` 沿用共享时钟校验；任何失败都不改变时钟、队列或计数。成功时先释放指定后端的一个连接，再清理截止时间不晚于 `now` 的等待请求，然后沿队首检查：把第一个仍能按同一最少连接规则立即分配的请求分配给任一当前可用后端并使其离队、对应后端计数加一；暂不可分配（没有健康后端或健康后端全部满载）时保留请求。返回键序固定为 released_backend_id、dispatched 的新字典：released_backend_id 为被释放后端 id；成功分配时 dispatched 为键序固定为 request_id、backend、queued_at、expires_at 的新字典，否则为 `null`。释放与释放后分配合计最坏 O(n)。
+* `advance(now)` 只推进时间，不尝试分配：截止时间不晚于 `now` 的等待请求按入队顺序离队并作为新列表返回，每项键序固定为 request_id、queued_at、expires_at；同一时刻重复推进幂等返回空列表。健康标记的变化不在推进时主动分配，而是在下一次 `submit` 或 `release_and_dispatch` 生效。
+* `pending()` 按队列顺序（最旧到最新）返回等待请求的隔离副本，每项键序固定为 request_id、queued_at、expires_at；返回的列表与字典均为新建对象，修改它们不污染内部状态。查询为 O(q)，q 为当前队列长度。
+* 所有失败路径都在完整校验后才抛出，不改变时钟、队列或计数。状态空间为 O(n+max_queue)，n 为后端数。
+
 ## 配置序列化（库接口）
 
 `BackendPool` 提供纯内存的配置快照导出与重建入口 `to_json()` 和类级入口 `from_json(text)`，仅作库接口：不接入命令行，不增加参数与落盘行为，`schedule` 的参数、输出、异常类型与退出码保持不变。快照只保存配置本身，不保存任何调度器游标、连接计数、会话绑定、健康检查计数或事件时间。
