@@ -24,7 +24,11 @@
   额外空间 O(1)；``explain()`` 返回键序固定的可重放解释（调用前游标、
   全部候选的稳定声明位置、selected、outcome、reason、next_cursor），
   与 select 同规则但无健康后端时不抛错，不推进游标或改变任何状态，
-  单次查询 O(n) 时间、除返回结果外额外空间 O(1)。
+  单次查询 O(n) 时间、除返回结果外额外空间 O(1)；``statistics()``
+  返回键序固定（policy、attempts、succeeded、failed、failures、
+  backends）的累计统计隔离副本，只由 select 累计，成功或失败选择
+  只增加 O(1) 统计开销，完整查询 O(n) 时间与 O(n) 返回空间，摘除
+  或恢复后端保留累计值。
 * ``WeightedRoundRobinScheduler(pool)``：按 weight 构造逻辑循环的加权轮询
   调度器，额外空间 O(n)，单次选择最坏 O(n) 时间、额外空间 O(1)；
   ``explain()`` 返回键序固定的可重放解释（调用前游标、全部候选的权重
@@ -353,6 +357,12 @@ class RoundRobinScheduler:
     位置与选中结果的可重放解释字典，健康变化立即体现在下一次解释中；
     池状态不变时，解释与紧随其后的 select 选中同一后端，且
     next_cursor 即该次 select 将写入的位置。
+
+    ``statistics()`` 返回构造以来累计的选择统计：每次 select 调用
+    （无论成功或抛出失败）都计入 attempts，成功时同时计入 succeeded
+    与被选后端的 selected，无健康后端的失败只计入 failed 与 failures
+    中唯一的 no_healthy_backend；explain、statistics 与健康标记变化
+    均不累计任何事件，摘除或恢复后端保留全部累计值。
     """
 
     def __init__(self, pool):
@@ -360,27 +370,76 @@ class RoundRobinScheduler:
             raise TypeError("pool must be a BackendPool instance")
         self._pool = pool
         self._cursor = -1
+        # 累计统计按声明顺序与池平行保存；统计只增不减，健康标记变化与
+        # 只读查询都不触碰这些值，额外空间 O(n)。
+        self._stats_attempts = 0
+        self._stats_succeeded = 0
+        self._stats_failed = 0
+        self._stats_failures = {"no_healthy_backend": 0}
+        self._stats_selected = [0] * len(pool._backends)
 
     def select(self):
         """选择并返回下一个健康后端。
 
         结果是键序固定为 id、address、port 的新字典；成功后游标推进到
-        所选位置。没有健康后端时抛出 NoAvailableBackendError，
-        池状态与游标均不改变。
+        所选位置。每次调用（无论成功或失败）都先把 attempts 加一；成功
+        时同时把 succeeded 与被选后端的 selected 加一。没有健康后端时
+        抛出 NoAvailableBackendError，池状态与游标均不改变，只增加
+        failed 与 failures 中的 no_healthy_backend。
         """
         backends = self._pool._backends
         size = len(backends)
+        # 每次 select 调用都计入尝试，包括随后抛出失败异常的调用。
+        self._stats_attempts += 1
         for offset in range(size):
             index = (self._cursor + 1 + offset) % size
             backend = backends[index]
             if backend["healthy"]:
                 self._cursor = index
+                self._stats_succeeded += 1
+                self._stats_selected[index] += 1
                 return {
                     "id": backend["id"],
                     "address": backend["address"],
                     "port": backend["port"],
                 }
+        self._stats_failed += 1
+        self._stats_failures["no_healthy_backend"] += 1
         raise NoAvailableBackendError("no healthy backend available")
+
+    def statistics(self):
+        """返回构造以来累计的选择统计的隔离副本。
+
+        结果是键序固定为 policy、attempts、succeeded、failed、failures、
+        backends 的新字典：policy 固定为 round_robin；attempts、
+        succeeded、failed 为从零开始的非负整数累计计数；failures 是
+        只含固定键 no_healthy_backend 的新字典；backends 按池声明顺序
+        排列，每项键序固定为 backend_id、selected，selected 是该后端
+        累计被选中次数，从未被选中的后端保留零值。每次 select 调用
+        增加 attempts：成功时同时增加 succeeded 与被选后端的 selected，
+        无健康后端的失败只增加 failed 与 no_healthy_backend，不推进
+        游标也不改变任何后端计数。explain、statistics 与健康标记变化
+        均不累计任何事件；摘除或恢复后端保留累计值。返回字典与列表
+        全部为新建对象，修改它们不污染内部状态或后续结果；池状态不变
+        时重复调用逐字段相同。单次查询 O(n) 时间与 O(n) 返回空间。
+        """
+        return {
+            "policy": "round_robin",
+            "attempts": self._stats_attempts,
+            "succeeded": self._stats_succeeded,
+            "failed": self._stats_failed,
+            "failures": {
+                "no_healthy_backend":
+                    self._stats_failures["no_healthy_backend"],
+            },
+            "backends": [
+                {
+                    "backend_id": backend["id"],
+                    "selected": self._stats_selected[index],
+                }
+                for index, backend in enumerate(self._pool._backends)
+            ],
+        }
 
     def explain(self):
         """返回一次普通轮询选择的可重放解释，不推进游标或改变任何状态。
