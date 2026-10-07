@@ -100,6 +100,8 @@
 * 命中（绑定仍健康）为 O(1)；首次选择与故障转移为 O(n)（一致性哈希评分）。
 * `bindings()` 按最久到最近成功使用顺序返回绑定列表，每项是键序固定为 key、backend_id 的隔离副本新字典；完整查询与绑定存储均为 O(max_sessions)。
 * `explain(key)` 不改变任何状态，返回键序固定为 policy、key、previous_backend_id、selected、outcome、reason、evicted_key、base_decision 的新字典：policy 固定为 `sticky_session`；previous_backend_id 为当前绑定后端 id（未绑定时为 `null`）；reason 只能为 `sticky_hit`、`new_binding`、`unhealthy_failover` 或 `no_healthy_backend`。命中时 base_decision 为 `null`；重新选择时 base_decision 为当前一致性哈希的完整 explain 结果。evicted_key 给出紧随其后的成功 select 将淘汰的 key（命中、替换绑定或未达上限时为 `null`）。池状态不变时，解释与紧随其后的 select 逐字段一致；没有健康后端时返回 outcome 为 `failed` 的解释而不抛错。
+* 库接口另提供 `statistics()`（不接入命令行，`schedule` 的参数、输出、异常类型与退出码保持不变）：返回键序固定为 policy、attempts、succeeded、failed、outcomes、failures、evicted、backends 的新字典，policy 固定为 `sticky_session`，各累计计数从零开始且为非负整数。每次通过 key 类型与值校验的 `select(key)` 调用先增加 attempts：成功时同时增加 succeeded、outcomes 中对应的结果（键序固定为 new_binding、sticky_hit、unhealthy_failover）与实际返回后端的 selected，一次调用只计一次；新绑定导致绑定数超限而实际淘汰最久未成功使用的 key 时增加 evicted；没有健康后端时仍抛出 `NoAvailableBackendError`，只增加 failed 与 failures 中的 `no_healthy_backend`（failures 仅含该键），绑定、使用顺序与其他计数均不改变；非字符串 key 抛出 `TypeError`、空字符串抛出 `ValueError` 时不产生任何统计变化。`explain(key)`、`bindings()`、`statistics()`、`BackendPool.set_healthy()` 与配置快照、热加载均不累计任何事件或清零历史；后端摘除、恢复或地址端口更新后沿用累计值；多个绑定同一 `BackendPool` 的调度器实例各自维护互不影响的统计。backends 按池声明顺序排列，每项键序固定为 backend_id、selected，未命中过的后端保留零值。
+* `statistics()` 返回的字典、outcomes 与 failures 字典及 backends 列表全部为新建对象，修改它们不污染内部状态或后续结果；状态不变时重复查询逐字段一致，相同调用序列可逐字节复现。累计状态占用 O(n) 空间，每次有效 `select` 只增加 O(1) 统计开销，完整查询使用 O(n) 时间与 O(n) 返回空间；其他库接口与既有选择序列保持原行为。
 
 ## 跨后端有界重试链（库接口）
 

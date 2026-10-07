@@ -101,7 +101,11 @@
   选择维护最近使用顺序：命中（绑定后端仍健康）平均 O(1)，首次选择与
   故障转移 O(n)（一致性哈希评分），超限时淘汰最久未成功使用的 key；
   ``bindings()`` 按最久到最近使用顺序返回 O(max_sessions) 的隔离副本，
-  ``explain(key)`` 返回键序固定的可重放解释且不改变状态。
+  ``explain(key)`` 返回键序固定的可重放解释且不改变状态；
+  ``statistics()`` 返回键序固定（policy、attempts、succeeded、
+  failed、outcomes、failures、evicted、backends）的累计统计隔离
+  副本，只由本实例的 select 累计，选择只增加 O(1) 统计开销，完整
+  查询 O(n) 时间与 O(n) 返回空间，摘除或恢复后端保留累计值。
 * ``RetryChainScheduler(pool, max_attempts)``：跨后端有界重试链调度器
   （库接口，不接入 schedule），自身无状态：``next_backend(key,
   failed_backend_ids)`` 在当前健康且未在本链失败的后端中沿用一致性
@@ -1616,6 +1620,16 @@ class StickySessionScheduler:
     max_sessions 时，先淘汰最久未成功使用的 key 再写入，相同事件序列
     下淘汰顺序确定。没有健康后端时抛出 NoAvailableBackendError，
     绑定与使用顺序均不改变；任何校验或选择失败都不产生部分修改。
+
+    ``statistics()`` 返回本实例构造以来累计的选择统计：每次通过 key
+    校验的 select 调用（无论成功或抛出失败）都计入 attempts，成功时
+    同时计入 succeeded、对应 outcome（new_binding、sticky_hit 或
+    unhealthy_failover）与实际返回后端的 selected，新绑定实际淘汰
+    最久未成功使用的 key 时计入 evicted；无健康后端的失败只计入
+    failed 与 failures 中的 no_healthy_backend。key 校验失败、
+    explain、bindings、statistics 与健康标记变化均不累计任何事件；
+    摘除或恢复后端保留全部累计值。统计只描述通过本实例发生的 select
+    调用，不影响共享同一后端池的其他调度器实例。
     """
 
     def __init__(self, pool, max_sessions):
@@ -1637,23 +1651,44 @@ class StickySessionScheduler:
         self._hash = ConsistentHashScheduler(pool)
         # 首项为最久未成功使用的绑定，末项为最近使用的绑定。
         self._bindings = OrderedDict()
+        # 累计统计按声明顺序与后端平行保存；统计只增不减，健康标记变化
+        # 与只读查询都不触碰这些值，额外空间 O(n)。
+        self._stats_attempts = 0
+        self._stats_succeeded = 0
+        self._stats_failed = 0
+        self._stats_outcomes = {
+            "new_binding": 0,
+            "sticky_hit": 0,
+            "unhealthy_failover": 0,
+        }
+        self._stats_failures = {"no_healthy_backend": 0}
+        self._stats_evicted = 0
+        self._stats_selected = [0] * len(pool._backends)
 
     def select(self, key):
         """返回 key 绑定的健康后端，必要时按一致性哈希首次选择或迁移。
 
         key 校验与 ConsistentHashScheduler.select 完全相同：非字符串
-        抛出 TypeError，空字符串抛出 ValueError，失败不改变状态。
-        绑定后端仍健康时直接命中并把 key 置为最近使用，平均 O(1)；
-        未绑定或绑定后端不健康时按一致性哈希在当前健康后端中选择
-        （O(n)），没有健康后端抛出 NoAvailableBackendError 且绑定与
-        使用顺序都不改变。成功后新绑定超过 max_sessions 时淘汰最久未
-        成功使用的 key。结果是键序固定为 id、address、port 的新字典。
+        抛出 TypeError，空字符串抛出 ValueError，失败不改变状态，全部
+        统计保持不变。每次通过校验的调用（无论成功或失败）都先把
+        attempts 加一。绑定后端仍健康时直接命中并把 key 置为最近使用，
+        平均 O(1)，同时计入 succeeded、outcomes 中的 sticky_hit 与
+        绑定后端的 selected；未绑定或绑定后端不健康时按一致性哈希在
+        当前健康后端中选择（O(n)），成功时计入 succeeded、对应
+        outcome（new_binding 或 unhealthy_failover）与被选后端的
+        selected，新绑定超过 max_sessions 而实际淘汰最久未成功使用的
+        key 时计入 evicted。没有健康后端时抛出 NoAvailableBackendError，
+        只增加 failed 与 failures 中的 no_healthy_backend，绑定、使用
+        顺序与各后端 selected 均不改变。结果是键序固定为 id、address、
+        port 的新字典。
         """
         if not isinstance(key, str):
             raise TypeError("key must be a string")
         if key == "":
             raise ValueError("key must be a non-empty string")
 
+        # 每次通过校验的 select 调用都计入尝试，包括随后抛出失败异常的调用。
+        self._stats_attempts += 1
         bindings = self._bindings
         bound_id = bindings.get(key)
         if bound_id is not None:
@@ -1661,6 +1696,9 @@ class StickySessionScheduler:
             if bound["healthy"]:
                 # 命中：只刷新最近使用顺序，不重新评分，O(1)。
                 bindings.move_to_end(key)
+                self._stats_succeeded += 1
+                self._stats_outcomes["sticky_hit"] += 1
+                self._stats_selected[self._pool._index[bound_id]] += 1
                 return {
                     "id": bound["id"],
                     "address": bound["address"],
@@ -1669,17 +1707,28 @@ class StickySessionScheduler:
 
         # 首次选择或故障转移：先取得一致性哈希决策（可能抛出
         # NoAvailableBackendError），在此之前不改动任何绑定。
-        selected = self._hash.select(key)
+        try:
+            selected = self._hash.select(key)
+        except NoAvailableBackendError:
+            # 无健康后端：只计入失败，绑定、使用顺序与其他计数均不改变。
+            self._stats_failed += 1
+            self._stats_failures["no_healthy_backend"] += 1
+            raise
         selected_id = selected["id"]
         if bound_id is None:
             # 新绑定：超限时先淘汰最久未成功使用的 key（首项）。
             if len(bindings) >= self._max_sessions:
                 bindings.popitem(last=False)
+                self._stats_evicted += 1
             bindings[key] = selected_id
+            self._stats_outcomes["new_binding"] += 1
         else:
             # 故障转移：原子替换绑定并刷新为最近使用，绑定数不变。
             bindings[key] = selected_id
             bindings.move_to_end(key)
+            self._stats_outcomes["unhealthy_failover"] += 1
+        self._stats_succeeded += 1
+        self._stats_selected[self._pool._index[selected_id]] += 1
         return selected
 
     def bindings(self):
@@ -1692,6 +1741,53 @@ class StickySessionScheduler:
             {"key": key, "backend_id": backend_id}
             for key, backend_id in self._bindings.items()
         ]
+
+    def statistics(self):
+        """返回本实例构造以来累计的选择统计的隔离副本。
+
+        结果是键序固定为 policy、attempts、succeeded、failed、outcomes、
+        failures、evicted、backends 的新字典：policy 固定为
+        sticky_session；attempts、succeeded、failed、evicted 为从零开始
+        的非负整数累计计数；outcomes 是键序固定为 new_binding、
+        sticky_hit、unhealthy_failover 的新字典；failures 是只含
+        no_healthy_backend 一个固定键的新字典；backends 按池声明顺序
+        排列，每项键序固定为 backend_id、selected，即使后端从未被选中、
+        当前不健康或随后恢复，也保留对应的零值或累计值。每次通过 key
+        校验的 select 调用增加 attempts：成功时同时增加 succeeded、
+        对应 outcome 与实际返回后端的 selected（一次调用只计一次），
+        新绑定实际淘汰最久未成功使用的 key 时增加 evicted；无健康后端
+        的失败只增加 failed 与 failures 中的 no_healthy_backend。key
+        校验失败、explain、bindings、statistics 与健康标记变化均不
+        累计任何事件；摘除或恢复后端保留累计值，多个绑定同一池的调度器
+        实例各自维护互不影响的统计。返回字典、outcomes 与 failures
+        字典及 backends 列表全部为新建对象，修改它们不污染内部状态或
+        后续结果；池状态不变时重复调用逐字段相同。单次查询 O(n) 时间
+        与 O(n) 返回空间。
+        """
+        return {
+            "policy": "sticky_session",
+            "attempts": self._stats_attempts,
+            "succeeded": self._stats_succeeded,
+            "failed": self._stats_failed,
+            "outcomes": {
+                "new_binding": self._stats_outcomes["new_binding"],
+                "sticky_hit": self._stats_outcomes["sticky_hit"],
+                "unhealthy_failover":
+                    self._stats_outcomes["unhealthy_failover"],
+            },
+            "failures": {
+                "no_healthy_backend":
+                    self._stats_failures["no_healthy_backend"],
+            },
+            "evicted": self._stats_evicted,
+            "backends": [
+                {
+                    "backend_id": backend["id"],
+                    "selected": self._stats_selected[index],
+                }
+                for index, backend in enumerate(self._pool._backends)
+            ],
+        }
 
     def explain(self, key):
         """返回一次会话绑定选择的可重放解释，不改变任何状态。
