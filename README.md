@@ -94,3 +94,12 @@
 * 记录是键序固定为 `flow`、`backend_id`、`state`、`created_at`、`last_activity_at`、`ended_at`、`end_reason` 的字典，`flow` 内保持五元组顺序；active 记录的 `ended_at` 与 `end_reason` 为 `null`。`connections()` 按建立顺序返回全部记录的隔离副本，`active_connections()` 按后端声明顺序返回每个后端的 active 连接数（新字典）。
 * 五元组类型错误抛出 `TypeError`、值错误抛出 `ValueError`，非法超时抛出 `ConfigurationError`，未知后端抛出 `KeyError`；任何失败都不改变状态。
 * 按五元组定位、记录活动与关闭平均 O(1) 时间，`advance` 与完整查询 O(n) 时间，空间 O(n)。
+
+### 连接事件日志与重放（库接口）
+
+`ConnectionTable` 提供确定性的内存事件日志与重建入口 `export_log()` 和类级入口 `ConnectionTable.replay_log(pool, idle_timeout, hard_timeout, text)`，仅作库接口：不接入 `schedule`，不落盘，不读墙上时钟，也不改变既有返回值、异常、到期规则及其他调度器行为。
+
+* 每次 `open_connection`、`record_activity`、`close_connection` 或 `advance` 成功返回后，按调用顺序追加一个事件；幂等的重复建立和重复关闭也各记录一次，抛出异常的调用不新增或改写日志。日志不记录查询和隐式到期项，到期由重放相同 `now` 时按现有规则重新计算。
+* `export_log()` 返回无末尾换行的紧凑 JSON 数组，事件键序固定为 sequence、operation、now、flow、backend_id：sequence 从零连续递增，operation 为 `open`、`activity`、`close`、`advance` 之一；`open` 记录规范化五元组、后端 id 和传入时间，`activity` 与 `close` 的 backend_id 为 `null`，`advance` 的 flow 和 backend_id 均为 `null`，五元组保持既有字段顺序。状态不变时重复导出逐字节一致，调用方对象和返回内容都不能污染内部日志。
+* `replay_log(pool, idle_timeout, hard_timeout, text)` 先完成解析与结构校验，再按 sequence 在新 `ConnectionTable` 上执行。text 非字符串抛出 `TypeError`；非法 JSON、顶层非数组、未知或缺失字段、类型错误、序号不连续、操作与可空字段组合不符，以及按给定池和超时无法合法执行的事件，统一抛出 `ConfigurationError`。失败不修改传入池也不暴露部分结果；成功表的 `connections()`、`active_connections()` 和再次导出的日志与原表逐字段、逐字节一致。
+* 单次追加为 O(1) 时间和空间，导出为 O(e)，重放的状态空间为 O(e+n)，其中 e 为事件数、n 为连接记录数。

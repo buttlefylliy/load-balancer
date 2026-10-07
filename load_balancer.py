@@ -70,6 +70,17 @@
   绑定后端池的连接生命周期表。时间只由显式 ``now`` 驱动；按五元组定位、
   记录活动与关闭平均 O(1) 时间，``advance`` 与完整查询 O(n) 时间，
   空间 O(n)。
+* ``ConnectionTable.export_log()`` / 类级入口
+  ``ConnectionTable.replay_log(pool, idle_timeout, hard_timeout, text)``：
+  确定性的内存事件日志与重建入口。open_connection、record_activity、
+  close_connection、advance 每次成功返回后按调用顺序追加一个事件
+  （幂等的重复建立与重复关闭也各记录一次，抛出异常的调用不记录）；
+  导出入口返回无末尾换行的紧凑 JSON 数组，事件键序固定为 sequence、
+  operation、now、flow、backend_id；重放入口先完成解析与结构校验，
+  再按 sequence 在新 ConnectionTable 上重放，日志结构非法或事件无法
+  按给定池与超时合法执行时统一抛出 ConfigurationError（文本非字符串
+  抛出 TypeError），失败不修改传入池也不暴露部分结果。单次追加
+  O(1) 时间与空间，导出 O(e)，重放状态空间 O(e+n)，e 为事件数。
 * ``ConnectionStateError``：连接状态非法时抛出（释放使活动连接数低于零、
   对非 active 连接记录活动、五元组冲突、now 回退等）。
 * ``HealthCheckTracker(pool, failure_threshold, recovery_threshold,
@@ -1447,6 +1458,75 @@ _RECORD_FIELDS = (
     "ended_at",
     "end_reason",
 )
+_EVENT_FIELDS = ("sequence", "operation", "now", "flow", "backend_id")
+_EVENT_OPERATIONS = ("open", "activity", "close", "advance")
+
+
+def _validate_log_event(event, position):
+    """校验单条日志事件的结构，返回规范化后的执行参数元组。
+
+    任何结构问题（事件不是对象、未知或缺失字段、类型错误、序号不连续、
+    操作与可空字段组合不符）都统一抛出 ConfigurationError；不会修改
+    调用方对象。返回 (operation, now, flow, backend_id)，其中 flow 为
+    规范化五元组或 None（advance），backend_id 为字符串或 None。
+    """
+    location = f"event at position {position}"
+    if not isinstance(event, dict):
+        raise ConfigurationError(f"{location}: expected an object")
+    unknown = [key for key in event if key not in _EVENT_FIELDS]
+    if unknown:
+        raise ConfigurationError(f"{location}: unknown field {unknown[0]!r}")
+    missing = [key for key in _EVENT_FIELDS if key not in event]
+    if missing:
+        raise ConfigurationError(f"{location}: missing field {missing[0]!r}")
+
+    sequence = event["sequence"]
+    # bool 是 int 的子类，序号必须显式排除布尔值。
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        raise ConfigurationError(f"{location}: sequence must be an integer")
+    if sequence != position:
+        raise ConfigurationError(
+            f"{location}: sequence must increase contiguously from zero"
+        )
+
+    operation = event["operation"]
+    if not isinstance(operation, str) or operation not in _EVENT_OPERATIONS:
+        raise ConfigurationError(
+            f"{location}: operation must be one of {_EVENT_OPERATIONS!r}"
+        )
+
+    now = event["now"]
+    # bool 是 int 的子类，时间戳必须显式排除布尔值。
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise ConfigurationError(f"{location}: now must be an integer")
+    if now < 0:
+        raise ConfigurationError(
+            f"{location}: now must be a non-negative integer"
+        )
+
+    flow = event["flow"]
+    backend_id = event["backend_id"]
+    if operation == "advance":
+        if flow is not None or backend_id is not None:
+            raise ConfigurationError(
+                f"{location}: advance requires null flow and backend_id"
+            )
+        prepared = None
+    else:
+        try:
+            prepared = _validate_flow(flow)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(f"{location}: {exc}") from None
+    if operation == "open":
+        if not isinstance(backend_id, str):
+            raise ConfigurationError(
+                f"{location}: open requires a string backend_id"
+            )
+    elif backend_id is not None:
+        raise ConfigurationError(
+            f"{location}: {operation} requires a null backend_id"
+        )
+    return operation, now, prepared, backend_id
 
 
 def _validate_flow(flow):
@@ -1529,6 +1609,16 @@ class ConnectionTable:
 
     按五元组定位、记录活动与关闭平均 O(1) 时间（到期处理由最小堆
     惰性完成），advance 与完整查询 O(n) 时间，空间 O(n)。
+
+    每次 open_connection、record_activity、close_connection 或
+    advance 成功返回后，按调用顺序向内存事件日志追加一个事件（幂等的
+    重复建立与重复关闭也各记录一次；抛出异常的调用不新增或改写日志）。
+    日志不记录查询与隐式到期项：到期由重放相同 now 时按既有规则重新
+    计算。``export_log()`` 把日志导出为无末尾换行的紧凑 JSON 数组；
+    类级入口 ``replay_log(pool, idle_timeout, hard_timeout, text)``
+    先完成解析与结构校验，再按 sequence 在新表上重放并返回该表。
+    单次追加 O(1) 时间与空间，导出 O(e)，重放状态空间 O(e+n)，
+    e 为事件数、n 为连接记录数。
     """
 
     def __init__(self, pool, idle_timeout, hard_timeout):
@@ -1559,6 +1649,21 @@ class ConnectionTable:
         self._active_counts = {
             backend["id"]: 0 for backend in pool._backends
         }
+        # 确定性内存事件日志：只在四个生命周期操作成功返回后追加，
+        # 元素为键序固定的新字典，sequence 从零连续递增。
+        self._events = []
+
+    def _append_event(self, operation, now, flow, backend_id):
+        """把一次成功操作追加到内存事件日志，O(1) 时间与空间。"""
+        self._events.append(
+            {
+                "sequence": len(self._events),
+                "operation": operation,
+                "now": now,
+                "flow": flow,
+                "backend_id": backend_id,
+            }
+        )
 
     def _validate_now(self, now):
         if isinstance(now, bool) or not isinstance(now, int):
@@ -1626,6 +1731,8 @@ class ConnectionTable:
         existing = self._by_flow.get(key)
         if existing is not None and existing["state"] == "active":
             if existing["backend_id"] == backend_id:
+                # 幂等的重复建立也记录一次事件。
+                self._append_event("open", now, dict(prepared), backend_id)
                 return _copy_record(existing)
             raise ConnectionStateError(
                 "flow already has an active connection on backend "
@@ -1651,6 +1758,7 @@ class ConnectionTable:
         heapq.heappush(self._expiry_heap, (hard_deadline, seq, 1))
         self._by_flow[key] = record
         self._active_counts[backend_id] += 1
+        self._append_event("open", now, dict(prepared), backend_id)
         return _copy_record(record)
 
     def record_activity(self, flow, now):
@@ -1671,6 +1779,7 @@ class ConnectionTable:
         idle_deadline = now + self._idle_timeout
         self._deadlines[record["seq"]][0] = idle_deadline
         heapq.heappush(self._expiry_heap, (idle_deadline, record["seq"], 0))
+        self._append_event("activity", now, dict(prepared), None)
         return _copy_record(record)
 
     def close_connection(self, flow, now):
@@ -1693,6 +1802,8 @@ class ConnectionTable:
             record["ended_at"] = now
             record["end_reason"] = "closed"
             self._active_counts[record["backend_id"]] -= 1
+        # 幂等的重复关闭也记录一次事件。
+        self._append_event("close", now, dict(prepared), None)
         return _copy_record(record)
 
     def advance(self, now):
@@ -1700,6 +1811,7 @@ class ConnectionTable:
         self._validate_now(now)
         self._now = now
         expired = self._process_expirations(now)
+        self._append_event("advance", now, None, None)
         return [_copy_record(record) for record in expired]
 
     def connections(self):
@@ -1712,6 +1824,76 @@ class ConnectionTable:
             backend["id"]: self._active_counts[backend["id"]]
             for backend in self._pool._backends
         }
+
+    def export_log(self):
+        """把内存事件日志导出为无末尾换行的紧凑 JSON 数组字符串。
+
+        数组按调用顺序排列，每个事件对象的键固定为 sequence、
+        operation、now、flow、backend_id：sequence 从零连续递增；
+        operation 为 open、activity、close、advance 之一；open 事件
+        记录规范化五元组、后端 id 与传入时间，activity 与 close 事件
+        的 backend_id 为 null，advance 事件的 flow 与 backend_id 均为
+        null；五元组保持 src_address、src_port、dst_address、dst_port、
+        protocol 的既有字段顺序。日志只记录成功返回的调用（含幂等的
+        重复建立与重复关闭），不记录查询与隐式到期项。状态不变时重复
+        导出逐字节一致；导出结果为新建字符串，调用方对象与返回内容都
+        不能污染内部日志。O(e) 时间，e 为事件数。
+        """
+        return json.dumps(
+            self._events, separators=(",", ":"), ensure_ascii=False
+        )
+
+    @classmethod
+    def replay_log(cls, pool, idle_timeout, hard_timeout, text):
+        """按事件日志在新 ConnectionTable 上重放并返回该表。
+
+        先完成 text 的解析与全部事件的结构校验，再按 sequence 在绑定
+        pool 的新表上依次执行；日志不记录查询与隐式到期项，到期由重放
+        相同 now 时按既有规则重新计算。text 非字符串抛出 TypeError；
+        非法 JSON、顶层非数组、未知或缺失字段、类型错误、序号不连续、
+        操作与可空字段组合不符，以及按给定池和超时无法合法执行的事件，
+        统一抛出 ConfigurationError。任何失败都不修改传入池，也不暴露
+        部分结果。成功时返回表的 connections、active_connections 与
+        再次导出的日志与原表逐字段、逐字节一致。idle_timeout 与
+        hard_timeout 沿用构造函数的既有校验。重放的状态空间为 O(e+n)，
+        e 为事件数、n 为连接记录数。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        try:
+            events = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(
+                f"invalid JSON: {exc}"
+            ) from None
+        if not isinstance(events, list):
+            raise ConfigurationError("event log must be a JSON array")
+        # 先完成全部事件的结构校验，再建立任何可见状态。
+        prepared = [
+            _validate_log_event(event, position)
+            for position, event in enumerate(events)
+        ]
+
+        table = cls(pool, idle_timeout, hard_timeout)
+        for position, (operation, now, flow, backend_id) in enumerate(
+            prepared
+        ):
+            try:
+                if operation == "open":
+                    table.open_connection(flow, backend_id, now)
+                elif operation == "activity":
+                    table.record_activity(flow, now)
+                elif operation == "close":
+                    table.close_connection(flow, now)
+                else:
+                    table.advance(now)
+            except (TypeError, ValueError, KeyError,
+                    ConnectionStateError) as exc:
+                raise ConfigurationError(
+                    f"event at position {position} cannot be replayed: "
+                    f"{exc}"
+                ) from None
+        return table
 
 
 class HealthCheckTracker:
