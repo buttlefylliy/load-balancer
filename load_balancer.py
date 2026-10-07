@@ -19,6 +19,25 @@
 * ``BackendPool.from_json(text)``：从 JSON 文本重建后端池；text 非字符串
   抛出 TypeError，非法 JSON、顶层非数组或任一后端不满足既有校验规则时
   统一抛出 ConfigurationError，全部校验完成后才创建与已有池隔离的新实例。
+* ``BackendPool.reload_json(text)``：在不替换池对象的前提下把兼容 JSON
+  快照热加载进当前池（库接口，不接入 schedule，也不读写文件）；text 沿用
+  from_json 的输入与字段语义，非字符串抛出 TypeError，JSON 语法、字段
+  或取值非法统一抛出 ConfigurationError。新快照必须与当前池具有相同的
+  后端数量、id 与声明顺序，且每个后端的 weight 不变；新增、删除、改名、
+  重排或改变 weight 也抛出 ConfigurationError。整份文本的解析、配置校验
+  与兼容性校验全部完成后才一次性就地提交 address、port、healthy 与
+  max_connections，任何失败都使原池 to_json 逐字节不变、绑定对象的可
+  观察状态不变；已绑定该池的调度器、连接表与健康检查跟踪器仍是同一实例，
+  已有游标、统计、活动连接、等待队列、会话绑定、检查状态与事件时钟均保持
+  不变，并从下一次公开操作开始看到新值。max_connections 可以降到当前
+  活动连接数以下，已有连接继续保留，依赖容量的调度器随后按既有满载规则
+  处理新选择，直到计数低于限制。成功时返回键序固定为 changed、backends
+  的隔离新字典：changed 表示规范化后的配置是否有语义变化，backends 仅按
+  池声明顺序列出实际变化的后端，每项键序为 backend_id、changed_fields，
+  changed_fields 按 address、port、healthy、max_connections 的固定顺序
+  列出变化字段；重复加载等价配置返回 changed 为 false 且 backends 为空，
+  不改变状态。提交后 to_json 立即反映新快照；单次热加载 O(n) 时间与
+  O(n) 临时空间，不读取墙上时钟。
 * ``RoundRobinScheduler(pool)``：绑定后端池的轮询调度器。
 * ``RoundRobinScheduler.select()``：返回下一个健康后端，最坏 O(n) 时间、
   额外空间 O(1)；``explain()`` 返回键序固定的可重放解释（调用前游标、
@@ -165,6 +184,8 @@ _LEAST_POLICY = "least_connections"
 _FIELDS = ("id", "address", "port", "healthy")
 _OPTIONAL_FIELDS = ("weight", "max_connections")
 _KNOWN_FIELDS = _FIELDS + _OPTIONAL_FIELDS
+# reload_json 唯一允许就地变化的字段及其在 changed_fields 中的固定顺序。
+_RELOAD_FIELDS = ("address", "port", "healthy", "max_connections")
 _COMPLEXITY = (
     "复杂度：建池为 O(n) 时间与 O(n) 空间；"
     "单次选择最坏 O(n) 时间且额外空间 O(1)；"
@@ -389,6 +410,99 @@ class BackendPool:
         # 构造器先完成全部校验再建立任何可见状态，失败时不会留下
         # 可观察的部分实例。
         return cls(configs)
+
+    def reload_json(self, text):
+        """在不替换池对象的前提下热加载一份兼容的 JSON 配置快照。
+
+        text 沿用 from_json 的输入与字段语义：必须是字符串，其他类型
+        抛出 TypeError；文本不是合法 JSON、不满足既有配置校验，或新
+        快照与当前池不兼容（后端数量不同、id 或声明顺序不一致，或任一
+        后端的 weight 改变）时，统一抛出 ConfigurationError。先完成
+        整份文本的解析、配置校验与兼容性校验，再一次性就地提交：只
+        更新各后端的 address、port、healthy 与 max_connections，列表、
+        id、声明位置与 weight 保持不变，因此已绑定该池的调度器、连接
+        表与健康检查跟踪器仍是同一实例，其游标、统计、活动连接、等待
+        队列、会话绑定、检查状态与事件时钟均保持不变，并从下一次公开
+        操作开始看到新值；任何失败都使原池 to_json 逐字节不变、绑定
+        对象的可观察状态不变。max_connections 可以降到当前活动连接数
+        以下，已有连接继续保留，依赖容量的调度器随后按既有满载规则处理
+        新选择。
+
+        成功返回键序固定为 changed、backends 的与内部状态隔离的新字典：
+        changed 表示规范化后的配置是否有语义变化；backends 仅按池声明
+        顺序列出实际变化的后端，每项键序固定为 backend_id、
+        changed_fields，changed_fields 按 address、port、healthy、
+        max_connections 的固定顺序列出真正变化的字段；重复加载等价配置
+        时 changed 为 false、backends 为空且不改变状态。提交后 to_json
+        立即反映新快照。单次热加载 O(n) 时间与 O(n) 临时空间，不读取
+        墙上时钟。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        try:
+            configs = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(f"invalid JSON: {exc}") from None
+        # 先复用与建池完全相同的配置校验取得防御性拷贝；此时尚未触碰
+        # 池的任何状态。
+        prepared = _validate_configs(configs)
+        current = self._backends
+        # 兼容性校验只允许数量、id、声明顺序与 weight 完全一致；只有
+        # 全部通过后才进入差异计算与提交。
+        if len(prepared) != len(current):
+            raise ConfigurationError(
+                "reload snapshot must contain the same number of backends"
+            )
+        changes = []
+        changed = False
+        for position, (incoming, backend) in enumerate(
+            zip(prepared, current)
+        ):
+            if incoming["id"] != backend["id"]:
+                raise ConfigurationError(
+                    f"backend at position {position}: id must remain "
+                    f"{backend['id']!r}, got {incoming['id']!r}"
+                )
+            if incoming["weight"] != backend["weight"]:
+                raise ConfigurationError(
+                    f"backend at position {position}: weight must remain "
+                    f"{backend['weight']}, got {incoming['weight']}"
+                )
+            changed_fields = [
+                field
+                for field in _RELOAD_FIELDS
+                if incoming[field] != backend[field]
+            ]
+            if changed_fields:
+                changed = True
+                changes.append(
+                    {
+                        "position": position,
+                        "backend_id": backend["id"],
+                        "changed_fields": changed_fields,
+                        "values": incoming,
+                    }
+                )
+
+        # 全部解析、校验与差异计算完成后一次性就地提交：复用既有后端
+        # 字典对象，只改写允许变化的四个字段，绑定对象持有的平行数组与
+        # 声明位置因此继续有效。
+        for change in changes:
+            backend = current[change["position"]]
+            values = change["values"]
+            for field in _RELOAD_FIELDS:
+                backend[field] = values[field]
+
+        return {
+            "changed": changed,
+            "backends": [
+                {
+                    "backend_id": change["backend_id"],
+                    "changed_fields": list(change["changed_fields"]),
+                }
+                for change in changes
+            ],
+        }
 
 
 class RoundRobinScheduler:
