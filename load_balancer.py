@@ -54,7 +54,11 @@
   胜出），不维护游标、连接计数或按键增长的缓存，单次选择最坏 O(n) 时间、
   额外空间 O(1)；``explain(key)`` 返回该次选择键序固定的可重放解释
   （全部候选与分数、selected、outcome、reason），与 select 同校验但
-  无健康后端时不抛错，单次查询 O(n) 时间、除返回结果外额外空间 O(1)。
+  无健康后端时不抛错，单次查询 O(n) 时间、除返回结果外额外空间 O(1)；
+  ``statistics()`` 返回键序固定（policy、attempts、succeeded、failed、
+  failures、backends）的累计统计隔离副本，只由本实例的 select 累计，
+  选择只增加 O(1) 统计开销，完整查询 O(n) 时间与 O(n) 返回空间，摘除或
+  恢复后端保留累计值。
 * ``StickySessionScheduler(pool, max_sessions)``：有界会话绑定调度器，
   以 OrderedDict 保存至多 max_sessions 个 key→backend_id 绑定并按成功
   选择维护最近使用顺序：命中（绑定后端仍健康）平均 O(1)，首次选择与
@@ -1011,12 +1015,28 @@ class ConsistentHashScheduler:
     ``explain(key)`` 复用同一校验与评分规则，但不抛出
     NoAvailableBackendError：返回包含全部候选及其分数、选中结果与失败
     原因的可重放解释字典，同样不修改任何状态，也不维护按键累计的状态。
+
+    ``statistics()`` 返回本实例构造以来累计的选择统计：每次通过 key
+    校验的 select 调用（无论成功或抛出失败）都计入 attempts，成功时
+    同时计入 succeeded 与实际返回后端的 selected，无健康后端的失败只
+    计入 failed 与 failures 中的 no_healthy_backend；key 校验失败
+    （TypeError、ValueError）不产生任何统计变化。explain、statistics
+    与健康标记变化均不累计任何事件；摘除或恢复后端保留全部累计值。
+    统计只描述通过本实例发生的 select 调用，不影响共享同一后端池的
+    其他调度器实例。
     """
 
     def __init__(self, pool):
         if not isinstance(pool, BackendPool):
             raise TypeError("pool must be a BackendPool instance")
         self._pool = pool
+        # 累计统计按声明顺序与后端平行保存；统计只增不减，健康标记变化
+        # 与只读查询都不触碰这些值，额外空间 O(n)。
+        self._stats_attempts = 0
+        self._stats_succeeded = 0
+        self._stats_failed = 0
+        self._stats_failures = {"no_healthy_backend": 0}
+        self._stats_selected = [0] * len(pool._backends)
 
     def select(self, key):
         """按会话键选择一个当前健康的后端。
@@ -1024,14 +1044,21 @@ class ConsistentHashScheduler:
         结果是键序固定为 id、address、port 的新字典；同一键在后端集合
         与健康状态不变时，无论调用次数以及与其他键的调用顺序如何，都
         返回逐字段相同的结果。key 不是字符串时抛出 TypeError，为空
-        字符串时抛出 ValueError，两种失败均不产生状态变化；没有健康
-        后端时抛出 NoAvailableBackendError，池与调度器状态均不改变。
+        字符串时抛出 ValueError，两种失败均不产生状态变化，也不累计
+        任何统计。每次通过 key 校验的调用（无论成功或失败）都先把
+        attempts 加一；成功时同时把 succeeded 与实际返回后端的
+        selected 加一（一次调用只计一次）。没有健康后端时抛出
+        NoAvailableBackendError，只增加 failed 与 failures 中的
+        no_healthy_backend，池状态与各后端命中计数均不改变。
         """
         if not isinstance(key, str):
             raise TypeError("key must be a string")
         if key == "":
             raise ValueError("key must be a non-empty string")
         backends = self._pool._backends
+        # 每次通过 key 校验的 select 调用都计入尝试，包括随后抛出
+        # 失败异常的调用。
+        self._stats_attempts += 1
         chosen = -1
         best_score = -1
         for index, backend in enumerate(backends):
@@ -1052,12 +1079,54 @@ class ConsistentHashScheduler:
                 best_score = score
                 chosen = index
         if chosen < 0:
+            self._stats_failed += 1
+            self._stats_failures["no_healthy_backend"] += 1
             raise NoAvailableBackendError("no healthy backend available")
+        self._stats_succeeded += 1
+        self._stats_selected[chosen] += 1
         backend = backends[chosen]
         return {
             "id": backend["id"],
             "address": backend["address"],
             "port": backend["port"],
+        }
+
+    def statistics(self):
+        """返回本实例构造以来累计的选择统计的隔离副本。
+
+        结果是键序固定为 policy、attempts、succeeded、failed、
+        failures、backends 的新字典：policy 固定为 consistent_hash；
+        attempts、succeeded、failed 为从零开始的非负整数累计计数；
+        failures 是只含 no_healthy_backend 一个固定键的新字典；
+        backends 按池声明顺序排列，每项键序固定为 backend_id、
+        selected，即使后端从未被选中、当前不健康或随后恢复，也保留
+        对应的零值或累计值。每次通过 key 校验的 select 调用增加
+        attempts：成功时同时增加 succeeded 与实际返回后端的
+        selected，无健康后端的失败只增加 failed 与 failures 中的
+        no_healthy_backend；key 校验失败（TypeError、ValueError）
+        不产生任何统计变化。explain、statistics 与健康标记变化均不
+        累计任何事件；摘除或恢复后端保留累计值，多个绑定同一池的
+        调度器实例各自维护互不影响的统计。返回字典、failures 字典与
+        backends 列表全部为新建对象，修改它们不污染内部状态或后续
+        结果；状态不变时重复调用逐字段相同。单次查询 O(n) 时间与
+        O(n) 返回空间。
+        """
+        return {
+            "policy": "consistent_hash",
+            "attempts": self._stats_attempts,
+            "succeeded": self._stats_succeeded,
+            "failed": self._stats_failed,
+            "failures": {
+                "no_healthy_backend":
+                    self._stats_failures["no_healthy_backend"],
+            },
+            "backends": [
+                {
+                    "backend_id": backend["id"],
+                    "selected": self._stats_selected[index],
+                }
+                for index, backend in enumerate(self._pool._backends)
+            ],
         }
 
     def explain(self, key):
