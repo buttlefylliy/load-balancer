@@ -12,6 +12,13 @@
 * ``BackendPool(configs)``：由后端配置列表建池，O(n) 时间、O(n) 空间；
   可选的 max_connections 为每后端声明并发上限，省略表示不限量。
 * ``BackendPool.set_healthy(backend_id, healthy)``：按 id 原子更新健康标记。
+* ``BackendPool.to_json()``：把池的当前配置快照导出为无末尾换行的紧凑
+  JSON 字符串（顶层为按声明顺序排列的后端数组，键序固定为 id、address、
+  port、healthy、weight，有限容量时末尾追加 max_connections），不保存
+  任何调度器游标、连接计数、会话绑定、健康检查计数或事件时间。
+* ``BackendPool.from_json(text)``：从 JSON 文本重建后端池；text 非字符串
+  抛出 TypeError，非法 JSON、顶层非数组或任一后端不满足既有校验规则时
+  统一抛出 ConfigurationError，全部校验完成后才创建与已有池隔离的新实例。
 * ``RoundRobinScheduler(pool)``：绑定后端池的轮询调度器。
 * ``RoundRobinScheduler.select()``：返回下一个健康后端，最坏 O(n) 时间、
   额外空间 O(1)；``explain()`` 返回键序固定的可重放解释（调用前游标、
@@ -282,6 +289,56 @@ class BackendPool:
         if index is None:
             raise KeyError(backend_id)
         return self._backends[index]["healthy"]
+
+    def to_json(self):
+        """把池的当前配置快照导出为紧凑 JSON 字符串（无末尾换行）。
+
+        顶层为按声明顺序排列的后端数组；每个后端对象的键固定按 id、
+        address、port、healthy、weight 排列，仅当 max_connections 有
+        有限值时才在末尾追加该键。缺省权重导出为 1，非 ASCII 字符直接
+        保留不转义。只导出配置快照：不保存任何调度器游标、连接计数、
+        会话绑定、健康检查计数或事件时间。池状态不变时重复调用逐字节
+        一致，set_healthy 的变更立即反映到下一次导出。O(n) 时间，
+        除返回字符串外额外空间 O(n)。
+        """
+        backends = []
+        for backend in self._backends:
+            entry = {
+                "id": backend["id"],
+                "address": backend["address"],
+                "port": backend["port"],
+                "healthy": backend["healthy"],
+                "weight": backend["weight"],
+            }
+            if backend["max_connections"] is not None:
+                entry["max_connections"] = backend["max_connections"]
+            backends.append(entry)
+        return json.dumps(
+            backends, separators=(",", ":"), ensure_ascii=False
+        )
+
+    @classmethod
+    def from_json(cls, text):
+        """从 JSON 文本重建后端池，返回与任何已有池隔离的新实例。
+
+        text 必须是字符串，其他类型抛出 TypeError；文本不是合法 JSON、
+        顶层不是数组，或任一后端不满足 BackendPool 的字段、类型、范围、
+        未知字段及重复 id 规则时，统一抛出 ConfigurationError。解析与
+        全部语义校验完成后才创建新池，任何失败都不产生可观察的部分
+        实例，也不改变已有池；重复导入同一文本得到彼此隔离但内容相同
+        的新对象。O(n) 时间，除返回对象外额外空间 O(n)。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        try:
+            configs = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(
+                f"invalid JSON: {exc}"
+            ) from None
+        # 构造器先完成全部校验再建立任何可见状态，失败时不会留下
+        # 可观察的部分实例。
+        return cls(configs)
 
 
 class RoundRobinScheduler:
