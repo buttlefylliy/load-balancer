@@ -62,6 +62,8 @@
 * 每次选择只比较当前健康后端：某后端被标记为不健康后，原本未选择它的键保持原选择，原本选择它的键在其余健康后端中重新映射；该后端恢复健康后，相同键按原评分规则重新选择，此前属于它的键确定性地回到它。健康变化在下一次 `select` 立即生效，选择过程不改写池或调度器状态。
 * 单次选择最坏 O(n) 时间，除摘要计算所需的固定大小数据外额外空间 O(1)。
 * `explain(key)` 给出一次选择的可重放解释：key 采用与 `select` 完全相同的类型与值校验（非字符串 `TypeError`、空字符串 `ValueError`，失败不改变状态），但不维护任何按键累计的状态、不修改池或调度器。返回键序固定为 policy、key、candidates、selected、outcome、reason 的新字典：policy 固定为 `consistent_hash`；candidates 按后端声明顺序排列，每项键序固定为 backend_id、healthy、score，健康后端的 score 是保留前导零的 64 位小写十六进制 SHA-256 摘要，不健康后端不参与比较且 score 为 `null`；selected 保持 id、address、port 的既有键序，outcome 为 `selected`、reason 为 `highest_score`，最高分相同时取声明顺序最前的健康后端。池状态不变时，explain 的 selected 与 `select` 对同一 key 的结果逐字段一致。没有健康后端时 explain 不抛出 `NoAvailableBackendError`，而是返回全部候选且 selected 为 `null`、outcome 为 `failed`、reason 为 `no_healthy_backend`；`select` 在同一情形下仍抛出 `NoAvailableBackendError`。返回结果与内部状态隔离，相同 key 与相同池状态下多次查询逐字段相同；单次查询 O(n) 时间，除返回的 O(n) 解释结果外只使用 O(1) 额外空间。
+* 库接口另提供 `statistics()`（不接入命令行，`schedule` 的参数、输出、异常类型与退出码保持不变）：返回键序固定为 policy、attempts、succeeded、failed、failures、backends 的新字典，policy 固定为 `consistent_hash`，各累计计数从零开始且为非负整数。每次通过 key 类型与值校验的 `select(key)` 调用先增加 attempts：成功时同时增加 succeeded 与实际返回后端的 selected，一次调用只计一次；没有健康后端时仍抛出 `NoAvailableBackendError`，只增加 failed 与 failures 中的 `no_healthy_backend`，所有后端命中数保持不变；非字符串 key 抛出 `TypeError`、空字符串抛出 `ValueError` 时不产生任何统计变化。`explain(key)`、`statistics()`、`BackendPool.set_healthy()` 与配置快照操作均不累计任何事件；后端摘除或恢复不清零历史统计；多个绑定同一 `BackendPool` 的调度器实例各自维护互不影响的统计。failures 是仅含 `no_healthy_backend` 的新字典；backends 按池声明顺序排列，每项键序固定为 backend_id、selected，未命中过的后端保留零值。
+* `statistics()` 返回的字典、failures 字典与 backends 列表全部为新建对象，修改它们不污染内部状态或后续结果；状态不变时重复查询逐字段一致。累计状态占用 O(n) 空间，每次有效 `select` 只增加 O(1) 统计开销，完整查询使用 O(n) 时间与 O(n) 返回空间；其他调度器与既有选择序列保持原行为。
 
 ## 有界会话绑定（库接口）
 
