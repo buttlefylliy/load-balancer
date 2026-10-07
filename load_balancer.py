@@ -1163,13 +1163,16 @@ class QueuedLeastConnectionsScheduler:
     （计数相同取声明顺序最前者），成功后把该后端计数加一。仅当存在
     健康后端但它们全部满载时，才在有界队列未满时把请求按 FIFO 入队。
 
-    时间只由调用方显式传入的 now 驱动，全部入口共享同一单调时钟：now
+    时间只由调用方显式传入的 now 驱动，全部写入口共享同一单调时钟：now
     必须是非布尔的非负整数，回退抛出 ConnectionStateError。等待请求在
     queued_at + queue_timeout 时刻到期（截止时刻不晚于 now 即清理）；
-    advance 只推进时间并按入队顺序返回本次到期的请求。
+    advance 只推进时间并按入队顺序返回本次到期的请求。explain 沿用同一
+    套类型、取值与单调校验，但只在只读视图中做虚拟清理，不推进时钟、
+    不离队、不改计数。
 
     选择与释放后分配最坏 O(n) 时间，入队与逐项过期摊销 O(1)，查询
-    O(q)，状态空间 O(n+max_queue)，q 为当前队列长度。
+    O(q)，explain 为 O(n+q)；状态空间 O(n+max_queue)，q 为当前队列
+    长度。
     """
 
     def __init__(self, pool, max_queue, queue_timeout):
@@ -1397,6 +1400,131 @@ class QueuedLeastConnectionsScheduler:
             }
             for request_id, queued_at, expires_at in self._queue
         ]
+
+    def explain(self, request_id, now):
+        """按 submit 的规则只读预览下一次提交，不改变任何状态。
+
+        request_id 与 now 沿用 submit 的类型、非空、非负及单调校验：
+        非字符串 request_id 抛 TypeError，空字符串抛 ValueError，now 非
+        整数或为布尔抛 TypeError，负数抛 ValueError，相对最后一次写入
+        入口回退抛 ConnectionStateError；校验失败不改变任何状态。解释在
+        只读视图中先虚拟排除 expires_at 不晚于 now 的等待项（不真实清理
+        队列），再处理仍在等待的同名请求：未到期的重复请求保持原
+        queued_at、expires_at 与从零开始的队列位置，reason 为
+        already_queued，即使有空闲后端也不改判，selected 为 None、
+        outcome 为 queued。其余请求按现有最少连接规则比较健康且未达
+        max_connections 的后端，计数相同取声明顺序最前者：可分配时
+        selected 为被选后端 id、outcome 为 selected、reason 为
+        least_connections；健康后端全部满载且虚拟清理后队列仍有空位时
+        outcome 为 queued、reason 为
+        all_healthy_backends_at_capacity，queued_at 为 now、expires_at
+        为 now + queue_timeout、queue_position 为虚拟清理后从队首开始
+        从零计的入队位置；没有健康后端时 outcome 为 failed、reason 为
+        no_healthy_backend，队列已满时为 failed、reason 为 queue_full，
+        两种失败都不抛出选择异常。
+
+        返回键序固定为 policy、request_id、now、candidates、selected、
+        outcome、reason、queued_at、expires_at、queue_position 的新字典：
+        policy 固定为 queued_least_connections；candidates 按池顺序排列，
+        每项键序固定为 backend_id、healthy、active_connections、
+        max_connections、eligible；不适用的字段均为 None。解释不推进
+        时钟、不清理真实队列、不改变计数，修改返回对象不影响后续结果；
+        状态不变时重复解释逐字段一致，随后以相同参数调用 submit 应得到
+        对应的选择、入队或异常。单次解释 O(n+q) 时间，除返回内容外只
+        使用 O(1) 额外空间。
+        """
+        if not isinstance(request_id, str):
+            raise TypeError("request_id must be a string")
+        if request_id == "":
+            raise ValueError("request_id must be a non-empty string")
+        self._validate_now(now)
+
+        backends = self._pool._backends
+        counts = self._counts
+        candidates = []
+        chosen = -1
+        saw_healthy = False
+        for index, backend in enumerate(backends):
+            healthy = backend["healthy"]
+            limit = backend["max_connections"]
+            # eligible 与 submit/_choose_backend 的筛选条件严格一致：
+            # 健康且计数低于上限，省略上限（None）时容量筛选始终通过。
+            eligible = healthy and (
+                limit is None or counts[index] < limit
+            )
+            candidates.append(
+                {
+                    "backend_id": backend["id"],
+                    "healthy": healthy,
+                    "active_connections": counts[index],
+                    "max_connections": limit,
+                    "eligible": eligible,
+                }
+            )
+            if not healthy:
+                continue
+            saw_healthy = True
+            if limit is not None and counts[index] >= limit:
+                continue
+            if chosen < 0 or counts[index] < counts[chosen]:
+                chosen = index
+
+        selected = None
+        reason = None
+        queued_at = None
+        expires_at = None
+        queue_position = None
+
+        # 单次顺序扫描队列同时完成虚拟到期清理、同名幂等判定与空位计数：
+        # position 只累计仍未到期（expires_at > now）的等待项；若同名
+        # 请求仍在等待，其 position 即从零开始的队列位置。
+        duplicate = False
+        position = 0
+        for queued_id, queued_time, expiry in self._queue:
+            if expiry <= now:
+                continue
+            if queued_id == request_id:
+                duplicate = True
+                queued_at = queued_time
+                expires_at = expiry
+                queue_position = position
+            position += 1
+
+        if duplicate:
+            # 未到期重复请求一律按原入队结果幂等解释，即使出现空闲后端
+            # 也不改判（与 submit 的等待短路一致）。
+            outcome = "queued"
+            reason = "already_queued"
+        elif chosen >= 0:
+            selected = backends[chosen]["id"]
+            outcome = "selected"
+            reason = "least_connections"
+        elif not saw_healthy:
+            outcome = "failed"
+            reason = "no_healthy_backend"
+        elif position >= self._max_queue:
+            # 健康后端全部满载且虚拟清理后仍无队列空位。
+            outcome = "failed"
+            reason = "queue_full"
+        else:
+            outcome = "queued"
+            reason = "all_healthy_backends_at_capacity"
+            queued_at = now
+            expires_at = now + self._queue_timeout
+            queue_position = position
+
+        return {
+            "policy": "queued_least_connections",
+            "request_id": request_id,
+            "now": now,
+            "candidates": candidates,
+            "selected": selected,
+            "outcome": outcome,
+            "reason": reason,
+            "queued_at": queued_at,
+            "expires_at": expires_at,
+            "queue_position": queue_position,
+        }
 
 
 class ConsistentHashScheduler:
