@@ -99,7 +99,12 @@
   ``explain(backend_id, success, now)`` 返回键序固定为 backend_id、
   success、checked_at、healthy、changed、consecutive_failures、
   consecutive_successes、reason 的只读预览，与 record_result 同校验
-  同判定但不修改任何状态，单次 O(1) 时间与 O(1) 额外空间。
+  同判定但不修改任何状态，单次 O(1) 时间与 O(1) 额外空间；
+  ``record_batch(results, now)`` 在同一事件时刻原子提交一批检查
+  结果：先完成整批校验与判定，再一次性提交全部结果与健康变更，
+  任一失败不留下部分修改；成功时按输入顺序返回与 record_result
+  相同键序的结果列表，k 个条目使用 O(k) 时间与 O(k) 暂存及返回
+  空间。
 """
 
 import argparse
@@ -1997,6 +2002,9 @@ class HealthCheckTracker:
 
     单次记录平均 O(1) 时间，advance 与 statuses 完整查询 O(n) 时间，
     空间 O(n)；``explain`` 单次为 O(1) 时间与 O(1) 额外空间。
+    ``record_batch`` 在同一事件时刻原子提交一批结果：先完成整批校验
+    与判定再一次性提交，任一失败不留下部分修改，k 个条目使用 O(k)
+    时间与 O(k) 暂存及返回空间。
     """
 
     def __init__(self, pool, failure_threshold, recovery_threshold,
@@ -2106,6 +2114,41 @@ class HealthCheckTracker:
             reason = "success_recorded" if success else "failure_recorded"
         return failures, successes, healthy, changed, reason
 
+    def _apply_event(self, index, backend_id, success, now, actual,
+                     projection):
+        """把已判定的事件写入跟踪状态与共享池，返回对外结果字典。
+
+        只在全部校验与判定完成后调用：外部 set_healthy 造成的状态偏移
+        在此以池中实际状态为准落盘，达到阈值时经 BackendPool.set_healthy
+        摘除或回切；同时更新 checked_at、changed 与幂等记录。返回与
+        内部状态隔离的新字典，键序固定为 backend_id、healthy、changed、
+        consecutive_failures、consecutive_successes、checked_at。
+        """
+        failures, successes, healthy, changed, _reason = projection
+        state = self._states[index]
+        if actual != state["known_healthy"]:
+            state["known_healthy"] = actual
+        state["consecutive_failures"] = failures
+        state["consecutive_successes"] = successes
+        if changed:
+            self._pool.set_healthy(backend_id, healthy)
+            state["known_healthy"] = healthy
+
+        state["checked_at"] = now
+        state["changed"] = changed
+        result = {
+            "backend_id": backend_id,
+            "healthy": healthy,
+            "changed": changed,
+            "consecutive_failures": failures,
+            "consecutive_successes": successes,
+            "checked_at": now,
+        }
+        state["last_now"] = now
+        state["last_success"] = success
+        state["last_result"] = result
+        return dict(result)
+
     def record_result(self, backend_id, success, now):
         """提交一次健康检查结果，返回键序固定的状态副本。
 
@@ -2132,32 +2175,118 @@ class HealthCheckTracker:
         # 以池中实际状态为准，并重置该后端的连续计数。判定（含阈值
         # 摘除/回切与原因）与 explain 共用同一纯计算，保持顺序一致。
         actual = self._pool._backends[index]["healthy"]
-        failures, successes, healthy, changed, _reason = self._project(
-            state, actual, success
+        projection = self._project(state, actual, success)
+        result = self._apply_event(
+            index, backend_id, success, now, actual, projection
         )
-        if actual != state["known_healthy"]:
-            state["known_healthy"] = actual
-        state["consecutive_failures"] = failures
-        state["consecutive_successes"] = successes
-        if changed:
-            self._pool.set_healthy(backend_id, healthy)
-            state["known_healthy"] = healthy
-
-        state["checked_at"] = now
-        state["changed"] = changed
-        result = {
-            "backend_id": backend_id,
-            "healthy": healthy,
-            "changed": changed,
-            "consecutive_failures": failures,
-            "consecutive_successes": successes,
-            "checked_at": now,
-        }
-        state["last_now"] = now
-        state["last_success"] = success
-        state["last_result"] = result
         self._now = now
-        return dict(result)
+        return result
+
+    def record_batch(self, results, now):
+        """在同一事件时刻原子提交一批健康检查结果。
+
+        results 是按调用方顺序排列的列表，每项为仅含 backend_id 与
+        success 的字典，批次中的 backend_id 不得重复。调用先完成整批
+        校验，再产生任何修改：results 不是列表、条目不是字典、字段
+        缺失或多余、backend_id 非字符串或 success 非布尔时抛出
+        TypeError；空列表或重复 id 抛出 ValueError；未知 id 抛出
+        KeyError；now 沿用 record_result 的非布尔非负整数与全局单调
+        时间线规则，类型错误抛出 TypeError，负值抛出 ValueError，时间
+        回退或某后端在同一 now 已记录相反 success 时抛出
+        ConnectionStateError。任一条目失败时，事件时钟、全部计数、
+        最近结果与 BackendPool 健康标记均保持不变。
+
+        整批判定以调用开始时的池健康快照与跟踪状态为准，输入顺序不
+        改变其他条目的阈值结论；外部 set_healthy 造成的状态偏移仍按
+        单条规则先重置对应计数再累计。成功时按输入顺序返回独立的新
+        列表，每项是键序固定为 backend_id、healthy、changed、
+        consecutive_failures、consecutive_successes、checked_at 的
+        新字典，字段语义与 record_result 一致，并一次性提交全部结果
+        及必要的健康变更。同一后端在同一 now 以相同 success 再次提交
+        时幂等返回既有结果副本，不重复累计；修改返回对象不影响后续
+        查询。单次调用对 k 个条目使用 O(k) 时间与 O(k) 暂存及返回
+        空间。
+        """
+        if not isinstance(results, list):
+            raise TypeError("results must be a list")
+        if not results:
+            raise ValueError("results must not be empty")
+        prepared = []
+        seen_ids = set()
+        for position, entry in enumerate(results):
+            location = f"result at position {position}"
+            if not isinstance(entry, dict):
+                raise TypeError(f"{location}: expected an object")
+            unknown = [
+                key for key in entry if key not in ("backend_id", "success")
+            ]
+            if unknown:
+                raise TypeError(f"{location}: unknown field {unknown[0]!r}")
+            missing = [
+                key
+                for key in ("backend_id", "success")
+                if key not in entry
+            ]
+            if missing:
+                raise TypeError(f"{location}: missing field {missing[0]!r}")
+            backend_id = entry["backend_id"]
+            if not isinstance(backend_id, str):
+                raise TypeError("backend id must be a string")
+            success = entry["success"]
+            if not isinstance(success, bool):
+                raise TypeError("success must be a boolean")
+            if backend_id in seen_ids:
+                raise ValueError(f"duplicate backend id: {backend_id!r}")
+            seen_ids.add(backend_id)
+            prepared.append((backend_id, success))
+        # bool 是 int 的子类，时间戳必须显式排除布尔值。
+        if isinstance(now, bool) or not isinstance(now, int):
+            raise TypeError("now must be an integer")
+        if now < 0:
+            raise ValueError("now must be a non-negative integer")
+        indices = []
+        for backend_id, _success in prepared:
+            index = self._pool._index.get(backend_id)
+            if index is None:
+                raise KeyError(backend_id)
+            indices.append(index)
+        if self._now is not None and now < self._now:
+            raise ConnectionStateError("now must not move backwards")
+
+        # 整批只读判定：以调用开始时的池健康快照与跟踪状态为准，
+        # 任何同刻冲突都在产生修改之前抛出。批次内 id 互不相同，
+        # 各条目的投影互不影响。
+        backends = self._pool._backends
+        plans = []
+        for (backend_id, success), index in zip(prepared, indices):
+            state = self._states[index]
+            if state["last_now"] is not None and now == state["last_now"]:
+                if success != state["last_success"]:
+                    raise ConnectionStateError(
+                        f"conflicting result for backend {backend_id!r} "
+                        f"at now={now}"
+                    )
+                plans.append((index, backend_id, success, None, None))
+                continue
+            actual = backends[index]["healthy"]
+            projection = self._project(state, actual, success)
+            plans.append((index, backend_id, success, actual, projection))
+
+        # 全部校验与判定完成后才一次性提交：写跟踪状态、必要的池健康
+        # 变更与幂等记录，最后推进事件时钟。
+        committed = []
+        for index, backend_id, success, actual, projection in plans:
+            state = self._states[index]
+            if projection is None:
+                committed.append(dict(state["last_result"]))
+                continue
+            committed.append(
+                self._apply_event(
+                    index, backend_id, success, now, actual, projection
+                )
+            )
+        self._now = now
+        return committed
 
     def explain(self, backend_id, success, now):
         """只读预览下一次检查会保持、摘除还是回切后端，不修改任何状态。
