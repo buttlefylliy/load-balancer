@@ -34,6 +34,26 @@
   healthy、max_connections 的固定顺序排列；等价配置重复加载返回 changed
   为 false 且 backends 为空且不改变状态。O(n) 时间与 O(n) 临时空间，
   不读取墙上时钟。
+* ``BackendPool.rollback_reload()``：单层热加载回滚，撤销最近一次真正
+  改变配置的成功热加载，同时继续使用同一个池对象（库接口，不接入
+  schedule，也不读写文件）。只有 changed 为 true 的成功 reload_json
+  才在提交前保存四个可热加载字段的规范化快照，后续新的有效变更覆盖旧
+  恢复点；等价重载、解析失败或兼容性校验失败都不创建、清除或改写已有
+  恢复点。调用先完成整份恢复数据的校验与差异计算，成功后才一次性把
+  address、port、healthy、max_connections 原地恢复到原后端对象并消费
+  恢复点；id、声明顺序与 weight 始终不变，不替换池、后端列表或后端
+  字典，已绑定调度器、连接表、等待队列、会话绑定、健康检查与熔断器的
+  游标、统计、连接计数、事件时钟和其他内部状态全部保留，从下一次操作
+  开始观察恢复后的配置；恢复出的 max_connections 可低于当前活动连接
+  数，沿用当前容量规则，不主动断开连接。没有可用恢复点（构造后尚未
+  发生有效热加载或恢复点已消费）时抛出 ConnectionStateError，池配置与
+  所有绑定对象状态不变。成功返回与 reload_json 相同结构的新字典，键序
+  固定为 changed、backends；backends 按池声明顺序只列出本次实际恢复的
+  后端，每项键序为 backend_id、changed_fields，changed_fields 按
+  address、port、healthy、max_connections 排列；即使热加载后又经
+  set_healthy 改过健康标记，也以保存的快照为准，差异反映调用前后的
+  真实变化。返回对象与内部状态隔离，相同有效调用序列结果确定。恢复点
+  占用 O(n) 空间，单次回滚 O(n) 时间，不读取墙上时钟。
 * ``RoundRobinScheduler(pool)``：绑定后端池的轮询调度器。
 * ``RoundRobinScheduler.select()``：返回下一个健康后端，最坏 O(n) 时间、
   额外空间 O(1)；``explain()`` 返回键序固定的可重放解释（调用前游标、
@@ -385,6 +405,10 @@ class BackendPool:
         prepared = _validate_configs(backends)
         self._backends = prepared
         self._index = {backend["id"]: i for i, backend in enumerate(prepared)}
+        # 单层热加载恢复点：仅由 changed 为 true 的成功 reload_json 在提交
+        # 前写入，rollback_reload 成功后消费（置回 None）；构造时尚无有效
+        # 热加载，等价重载与各类失败都不触碰它。占用 O(n) 空间。
+        self._rollback_snapshot = None
 
     def __len__(self):
         return len(self._backends)
@@ -491,6 +515,11 @@ class BackendPool:
         为 false 且 backends 为空，不改变状态；修改返回对象不污染后续
         结果。提交后 to_json 立即反映新快照。单次热加载 O(n) 时间与
         O(n) 临时空间，不读取墙上时钟。
+
+        只有 changed 为 true 的成功调用才在提交前把四个可热加载字段的
+        规范化值保存为单层恢复点（O(n) 空间），供 rollback_reload 撤销；
+        新的有效变更覆盖旧恢复点，等价重载与任何解析、校验失败都不创建、
+        清除或改写已有恢复点。
         """
         if not isinstance(text, str):
             raise TypeError("text must be a string")
@@ -547,6 +576,16 @@ class BackendPool:
                 )
                 pending.append((existing, incoming))
 
+        # 仅在确有语义变化时刷新单层恢复点：保存提交前四个可热加载字段
+        # 的规范化值（均为不可变标量，元组列表即与池状态隔离），随后的
+        # 新有效变更覆盖旧恢复点；等价重载与上面的任何解析、校验失败都
+        # 不会创建、清除或改写已有恢复点。
+        if changed:
+            self._rollback_snapshot = [
+                tuple(backend[field] for field in variable_fields)
+                for backend in current
+            ]
+
         # 一次性提交允许变化的字段；在原字典上原地更新，保留池列表、
         # 声明顺序、各后端身份及 weight，绑定对象持有的索引与计数等
         # 平行数组继续有效。
@@ -555,6 +594,75 @@ class BackendPool:
                 existing[field] = incoming[field]
 
         return {"changed": changed, "backends": changed_backends}
+
+    def rollback_reload(self):
+        """撤销最近一次真正改变配置的成功热加载，返回恢复差异清单。
+
+        把最近恢复点中的 address、port、healthy、max_connections 原子
+        恢复到原后端对象：id、声明顺序与 weight 始终不变，提交在原有
+        后端字典上原地进行，因此不替换 BackendPool、后端列表或后端字典，
+        已绑定该池的调度器、连接表、等待队列、会话绑定、健康检查与熔断
+        器继续保留各自游标、统计、连接计数、事件时钟和其他内部状态，并从
+        下一次公开操作开始观察恢复后的配置。恢复出的 max_connections
+        可以低于当前活动连接数，沿用当前容量规则，不主动断开连接。
+
+        恢复点只由 changed 为 true 的成功 reload_json 在提交前保存，
+        后续新的有效变更覆盖旧恢复点；等价重载、解析失败或兼容性校验
+        失败都不创建、清除或改写恢复点。没有可用恢复点时（构造后尚未
+        发生有效热加载，或恢复点已被本入口消费）抛出
+        ConnectionStateError，池配置与所有绑定对象的状态保持不变。
+
+        调用先基于快照完成整份恢复数据的校验与差异计算，成功后才一次
+        性提交并消费恢复点（置回 None）；即使热加载后又经 set_healthy
+        改过健康标记，恢复也以保存的快照为准。返回与 reload_json 相同
+        结构的新字典，键序固定为 changed、backends；backends 按池声明
+        顺序只列出本次实际恢复的后端，每项键序固定为 backend_id、
+        changed_fields，changed_fields 按 address、port、healthy、
+        max_connections 的固定顺序排列，差异反映调用前后的真实变化。
+        返回对象与内部状态隔离；相同有效调用序列产生确定结果。单次
+        回滚 O(n) 时间，除返回结果外只使用 O(n) 临时空间，不读取墙上
+        时钟。
+        """
+        snapshot = self._rollback_snapshot
+        if snapshot is None:
+            raise ConnectionStateError(
+                "no reload restore point is available"
+            )
+        current = self._backends
+        variable_fields = ("address", "port", "healthy", "max_connections")
+
+        # 先在暂存列表上完成差异计算，再一次性提交，保证任何意外的结构
+        # 不一致都在触碰池状态前暴露，不产生部分修改。
+        changed_backends = []
+        pending = []
+        for existing, saved in zip(current, snapshot):
+            changed_fields = [
+                field
+                for field, old_value in zip(variable_fields, saved)
+                if old_value != existing[field]
+            ]
+            if changed_fields:
+                changed_backends.append(
+                    {
+                        "backend_id": existing["id"],
+                        "changed_fields": changed_fields,
+                    }
+                )
+                pending.append((existing, saved))
+
+        # 一次性提交并消费恢复点：在原字典上原地恢复，池对象、后端列表、
+        # 各后端身份、声明顺序与 weight 全部保持不变。changed 反映调用
+        # 前后的真实差异（热加载后若已被 set_healthy 改回快照值，对应
+        # 字段不产生实际变化）；恢复点存在即视为成功并照常消费。
+        for existing, saved in pending:
+            for field, old_value in zip(variable_fields, saved):
+                existing[field] = old_value
+        self._rollback_snapshot = None
+
+        return {
+            "changed": bool(changed_backends),
+            "backends": changed_backends,
+        }
 
 
 class RoundRobinScheduler:
