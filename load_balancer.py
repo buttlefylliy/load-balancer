@@ -34,6 +34,24 @@
   healthy、max_connections 的固定顺序排列；等价配置重复加载返回 changed
   为 false 且 backends 为空且不改变状态。O(n) 时间与 O(n) 临时空间，
   不读取墙上时钟。
+* ``BackendPool.rollback_reload()``：撤销最近一次真正改变配置的成功热
+  加载（库接口，不接入 schedule，也不读写文件或读取墙上时钟）。恢复点
+  只在 reload_json 返回 changed 为 true 时于提交前保存四个可变字段的
+  规范化快照，随后新的有效变更覆盖旧恢复点；等价重载、解析失败或兼容性
+  校验失败都不创建、清除或改写已有恢复点。调用时把恢复点中的 address、
+  port、healthy、max_connections 在原后端字典上原地恢复，id、声明顺序
+  与 weight 始终不变，池对象、后端列表与各后端字典身份保持不变，已绑定
+  的调度器、连接表、等待队列、会话绑定、健康检查跟踪器与熔断器保留各自
+  游标、统计、活动连接计数、事件时钟与其他内部状态，从下一次公开操作开始
+  观察恢复后的配置；恢复出的 max_connections 可以低于当前活动连接数，
+  沿用既有容量规则，不主动断开连接。回滚前先完成整份恢复数据的校验与差异
+  计算，成功后才一次性提交并消费恢复点；构造后尚未发生有效热加载或恢复点
+  已消费时统一抛出 ConnectionStateError，池配置与所有绑定对象状态不变。
+  成功返回与 reload_json 相同结构的新字典，键序固定为 changed、
+  backends，backends 按池声明顺序只列出本次实际恢复的后端，
+  changed_fields 按 address、port、healthy、max_connections 排列；
+  即使热加载后又经 set_healthy 改过健康标记，也以保存的快照为准，返回
+  差异反映调用前后的真实变化。恢复点占用 O(n) 空间，单次回滚 O(n) 时间。
 * ``RoundRobinScheduler(pool)``：绑定后端池的轮询调度器。
 * ``RoundRobinScheduler.select()``：返回下一个健康后端，最坏 O(n) 时间、
   额外空间 O(1)；``explain()`` 返回键序固定的可重放解释（调用前游标、
@@ -385,6 +403,12 @@ class BackendPool:
         prepared = _validate_configs(backends)
         self._backends = prepared
         self._index = {backend["id"]: i for i, backend in enumerate(prepared)}
+        # 单层热加载恢复点：None 表示当前没有可恢复点（构造后尚未发生
+        # 真正改变配置的成功热加载，或恢复点已被回滚消费）。非 None 时
+        # 为按声明顺序平行排列的四个可变字段快照，与内部后端字典完全
+        # 隔离；只在 reload_json 提交 changed 为 true 的热加载前重写，
+        # 等价重载与各类失败都不触碰它。占用 O(n) 空间。
+        self._reload_snapshot = None
 
     def __len__(self):
         return len(self._backends)
@@ -547,12 +571,91 @@ class BackendPool:
                 )
                 pending.append((existing, incoming))
 
+        # 只有真正改变配置的成功热加载才在提交前保存（覆盖）单层恢复点：
+        # 按声明顺序保存提交前四个可变字段的规范化快照，值均为不可变对象，
+        # 与内部后端字典完全隔离。等价重载（changed 为 false）走到这里时
+        # pending 为空且不得创建、清除或改写已有恢复点，因此只在 changed
+        # 为 true 时重写；解析失败与兼容性失败在更早的校验阶段抛出，同样
+        # 不触碰已有恢复点。
+        if changed:
+            self._reload_snapshot = [
+                tuple(existing[field] for field in variable_fields)
+                for existing in current
+            ]
+
         # 一次性提交允许变化的字段；在原字典上原地更新，保留池列表、
         # 声明顺序、各后端身份及 weight，绑定对象持有的索引与计数等
         # 平行数组继续有效。
         for existing, incoming in pending:
             for field in variable_fields:
                 existing[field] = incoming[field]
+
+        return {"changed": changed, "backends": changed_backends}
+
+    def rollback_reload(self):
+        """撤销最近一次真正改变配置的成功热加载，返回恢复变化清单。
+
+        恢复点只在 reload_json 返回 changed 为 true 时于提交前保存，
+        随后新的有效变更覆盖旧恢复点；等价重载、解析失败或兼容性校验
+        失败都不会创建、清除或改写它。构造后尚未发生有效热加载，或恢复
+        点已被上一次回滚消费时，统一抛出 ConnectionStateError，池配置与
+        所有绑定对象的状态保持不变。
+
+        回滚先完成整份恢复数据的差异计算，再一次性把 address、port、
+        healthy、max_connections 四个字段恢复到原后端字典，成功后随即
+        消费（清空）恢复点：id、声明顺序、各后端身份与 weight 始终不变，
+        池对象、后端列表与后端字典均不替换，已绑定该池的调度器、连接表、
+        等待队列、会话绑定、健康检查跟踪器与熔断器继续保留各自的游标、
+        累计统计、活动连接计数、事件时钟及其他内部状态，从下一次公开操作
+        开始观察恢复后的配置。恢复出的 max_connections 可以低于当前活动
+        连接数，沿用既有容量规则，不主动断开已有连接。热加载后又经
+        set_healthy 改动的健康标记也以保存的快照为准。
+
+        成功时返回与 reload_json 相同结构的新字典，键序固定为 changed、
+        backends：changed 表示本次回滚是否真的改变了配置；backends 按池
+        声明顺序只列出本次实际恢复（调用前后有差异）的后端，每项键序固定
+        为 backend_id、changed_fields，changed_fields 按 address、port、
+        healthy、max_connections 的固定顺序排列。若当前配置已与快照一致
+        （例如热加载后经 set_healthy 改回了快照中的健康标记），changed
+        为 false 且 backends 为空，但恢复点仍被消费。修改返回对象不污染
+        后续结果。单次回滚 O(n) 时间与 O(n) 临时空间，不读取墙上时钟。
+        """
+        snapshot = self._reload_snapshot
+        if snapshot is None:
+            raise ConnectionStateError(
+                "no reload checkpoint is available"
+            )
+        current = self._backends
+        variable_fields = ("address", "port", "healthy", "max_connections")
+
+        # 先在暂存列表上完成整份恢复数据的差异计算，再一次性提交，保证
+        # 返回结果与内部状态隔离；快照由内部经完整校验的规范化配置生成，
+        # 与声明顺序逐位平行。
+        changed_backends = []
+        pending = []
+        changed = False
+        for existing, saved in zip(current, snapshot):
+            changed_fields = [
+                field
+                for position, field in enumerate(variable_fields)
+                if saved[position] != existing[field]
+            ]
+            if changed_fields:
+                changed = True
+                changed_backends.append(
+                    {
+                        "backend_id": existing["id"],
+                        "changed_fields": changed_fields,
+                    }
+                )
+                pending.append((existing, saved))
+
+        # 一次性原地恢复四个字段并消费恢复点；不替换池、列表或后端字典，
+        # 绑定对象持有的索引、游标与计数等平行状态继续有效。
+        for existing, saved in pending:
+            for position, field in enumerate(variable_fields):
+                existing[field] = saved[position]
+        self._reload_snapshot = None
 
         return {"changed": changed, "backends": changed_backends}
 

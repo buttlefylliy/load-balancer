@@ -81,6 +81,16 @@
 * 成功时返回与内部状态隔离的新字典，键顺序固定为 `changed`、`backends`：`changed` 表示规范化后的配置是否有语义变化；`backends` 仅按池声明顺序列出实际发生变化的后端，每项键顺序固定为 `backend_id`、`changed_fields`，`changed_fields` 按 `address`、`port`、`healthy`、`max_connections` 的固定顺序列出变化字段。重复加载等价配置返回 `changed` 为 `false`、`backends` 为空列表且不改变任何状态；修改返回对象不污染后续结果。提交后 `to_json()` 立即反映新快照，既有 `set_healthy()`、`from_json()`、各调度策略与命令行行为保持兼容。
 * 单次热加载使用 O(n) 时间与 O(n) 临时空间，不读取墙上时钟。
 
+## 热加载回滚（库接口）
+
+`BackendPool` 另提供实例入口 `rollback_reload()`，在继续使用同一个池对象的前提下撤销最近一次真正改变配置的成功热加载；仅作库接口：不接入 `schedule`，不增加文件读写或墙上时钟依赖，导入、导出、热加载与命令行行为保持兼容。
+
+* 恢复点只在 `reload_json` 返回 `changed` 为 `true` 时于提交前保存一份规范化配置快照（按声明顺序保存每个后端的 `address`、`port`、`healthy`、`max_connections`）。后续新的有效变更覆盖旧恢复点（始终只有单层）；等价重载（`changed` 为 `false`）、JSON 解析失败或兼容性校验失败都不创建、清除或改写已有恢复点。
+* `rollback_reload()` 调用时先完成整份恢复数据的校验与差异计算，成功后才一次性把恢复点中的 `address`、`port`、`healthy`、`max_connections` 恢复到原后端对象：`id`、声明顺序与 `weight` 始终不变。没有可用恢复点（构造后尚未发生有效热加载，或恢复点已经被消费）时统一抛出 `ConnectionStateError`，池配置与所有绑定对象的状态保持不变。
+* 回滚不替换 `BackendPool`、后端列表或后端字典：已绑定的调度器、`ConnectionTable`、等待队列、会话绑定、`HealthCheckTracker` 与 `CircuitBreakerScheduler` 继续保留各自游标、累计统计、活动连接计数、事件时钟与其他内部状态，从下一次公开操作开始观察恢复后的配置。恢复出的 `max_connections` 可以低于现有活动连接数，沿用当前容量规则，不主动断开已有连接。即使热加载后又通过 `set_healthy()` 改过健康标记，回滚也以保存的快照为准。
+* 成功返回与 `reload_json` 相同结构的新字典，键序固定为 `changed`、`backends`：`backends` 按池声明顺序只列出本次实际恢复（调用前后存在真实差异）的后端，每项键序固定为 `backend_id`、`changed_fields`，`changed_fields` 按 `address`、`port`、`healthy`、`max_connections` 排列；返回差异反映调用前后的真实变化。若当前配置已与快照逐字段一致（例如热加载后又经 `set_healthy()` 改回快照中的健康标记），`changed` 为 `false`、`backends` 为空，但恢复点仍被消费。返回对象与内部状态隔离；相同有效调用序列产生确定结果。
+* 恢复点占用 O(n) 空间，单次热加载与回滚均为 O(n) 时间。
+
 ## 一致性哈希（库接口）
 
 库接口提供 `ConsistentHashScheduler(pool)`，可从 `load_balancer` 直接导入；`schedule` 命令不新增该策略，参数、输出、异常类型与退出码保持不变。
