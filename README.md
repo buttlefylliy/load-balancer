@@ -66,6 +66,17 @@
 * 用 `from_json(to_json())` 重建的池保持后端顺序、地址、端口、当前健康标记、权重与容量语义，绑定重建池的各调度器初始选择结果与原池一致。
 * 序列化与导入均只使用 Python 标准库，时间与额外工作空间为 O(n)（n 为后端数，输出字符串占用不计入额外空间）。
 
+## 配置热加载（库接口）
+
+`BackendPool` 另提供实例入口 `reload_json(text)`，在**不替换池对象**的前提下热加载兼容快照；仅作库接口：不接入 `schedule`，不增加文件读写，命令的参数、输出、异常类型与退出码保持不变。
+
+* `text` 沿用 `from_json` 的输入与字段语义：非字符串抛出 `TypeError`；JSON 语法错误、顶层非数组、字段缺失或多余、类型或取值非法，统一抛出 `ConfigurationError`。
+* 新快照必须与当前池**兼容**：后端数量相同，按声明顺序逐位具有相同 `id`，且每个后端的 `weight` 不变。新增、删除后端、改名、调整声明顺序或改变任何 `weight` 均抛出 `ConfigurationError`。
+* 调用先在与内部状态隔离的数据上完成整份文本的解析、配置校验与兼容性校验，再一次性提交允许变化的字段（`address`、`port`、`healthy`、`max_connections`）。任何失败都不写入池：失败前后 `to_json()` 逐字节一致，已绑定该池的调度器、`ConnectionTable` 与 `HealthCheckTracker` 的可观察状态也不改变。
+* 提交在原后端对象上原地更新，因此已绑定该池的调度器、连接表与健康检查跟踪器仍是同一实例：调度器游标与累计统计、活动连接计数、等待队列、会话绑定、健康检查连续计数与检查状态、事件时钟均保持不变；它们从下一次公开操作开始看到新的 address、port、healthy 与 max_connections。`max_connections` 允许降到当前活动连接数以下：已有连接继续保留，依赖容量的调度器随后按既有满载规则处理新选择，直到计数低于限制。
+* 成功时返回与内部状态隔离的新字典，键顺序固定为 `changed`、`backends`：`changed` 表示规范化后的配置是否有语义变化；`backends` 仅按池声明顺序列出实际发生变化的后端，每项键顺序固定为 `backend_id`、`changed_fields`，`changed_fields` 按 `address`、`port`、`healthy`、`max_connections` 的固定顺序列出变化字段。重复加载等价配置返回 `changed` 为 `false`、`backends` 为空列表且不改变任何状态；修改返回对象不污染后续结果。提交后 `to_json()` 立即反映新快照，既有 `set_healthy()`、`from_json()`、各调度策略与命令行行为保持兼容。
+* 单次热加载使用 O(n) 时间与 O(n) 临时空间，不读取墙上时钟。
+
 ## 一致性哈希（库接口）
 
 库接口提供 `ConsistentHashScheduler(pool)`，可从 `load_balancer` 直接导入；`schedule` 命令不新增该策略，参数、输出、异常类型与退出码保持不变。
