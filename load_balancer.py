@@ -12,6 +12,15 @@
 * ``BackendPool(configs)``：由后端配置列表建池，O(n) 时间、O(n) 空间；
   可选的 max_connections 为每后端声明并发上限，省略表示不限量。
 * ``BackendPool.set_healthy(backend_id, healthy)``：按 id 原子更新健康标记。
+* ``BackendPool.to_json()``：把池的当前配置快照导出为不带末尾换行的
+  紧凑 JSON 字符串（顶层按声明顺序排列，每后端键序固定为 id、address、
+  port、healthy、weight，仅在 max_connections 有有限值时末尾追加；
+  缺省权重导出为 1，不限容量不导出该键，非 ASCII 直接保留），不导出
+  任何调度器游标、连接计数、会话绑定、健康检查计数或事件时间，单次
+  O(n) 时间；``BackendPool.from_json(text)`` 从该字符串重建彼此隔离的
+  新池，非字符串抛 TypeError，非法 JSON、顶层非数组或任一后端违反既有
+  字段、类型、范围、未知字段与重复 id 规则时统一抛 ConfigurationError，
+  解析与全部校验完成后才建池，单次 O(n) 时间与空间。
 * ``RoundRobinScheduler(pool)``：绑定后端池的轮询调度器。
 * ``RoundRobinScheduler.select()``：返回下一个健康后端，最坏 O(n) 时间、
   额外空间 O(1)；``explain()`` 返回键序固定的可重放解释（调用前游标、
@@ -282,6 +291,64 @@ class BackendPool:
         if index is None:
             raise KeyError(backend_id)
         return self._backends[index]["healthy"]
+
+    def to_json(self):
+        """把池的当前配置快照导出为不带末尾换行的紧凑 JSON 字符串。
+
+        顶层是按池声明顺序排列的后端数组；每个后端对象的键固定按 id、
+        address、port、healthy、weight 排列，仅当 max_connections 有有限
+        值时才在末尾追加该键：缺省权重统一导出为 1，不限容量
+        （max_connections 为 None）时不导出该键；非 ASCII 字符直接保留
+        （ensure_ascii=False）。只导出配置快照，不包含任何调度器游标、
+        连接计数、会话绑定、健康检查计数或事件时间。池状态不变时重复
+        调用逐字节一致，set_healthy 的成功变更立即反映到下一次导出；
+        from_json(to_json()) 重建的池保持后端顺序、地址、端口、当前健康
+        标记、权重与容量语义。单次导出 O(n) 时间，输出字符串不计入额外
+        空间时使用 O(n) 工作空间。
+        """
+        snapshot = []
+        for backend in self._backends:
+            entry = {
+                "id": backend["id"],
+                "address": backend["address"],
+                "port": backend["port"],
+                "healthy": backend["healthy"],
+                "weight": backend["weight"],
+            }
+            max_connections = backend["max_connections"]
+            if max_connections is not None:
+                entry["max_connections"] = max_connections
+            snapshot.append(entry)
+        return json.dumps(
+            snapshot, separators=(",", ":"), ensure_ascii=False
+        )
+
+    @classmethod
+    def from_json(cls, text):
+        """从 JSON 配置文本创建与任何已有池隔离的新后端池。
+
+        text 必须是字符串：其他类型（包括 bytes 与 bytearray）抛出
+        TypeError。文本不是合法 JSON、顶层不是数组，或任一后端不满足
+        BackendPool 已有的字段、类型、范围、未知字段及重复 id 规则时，
+        统一抛出 ConfigurationError；解析与全部语义校验完成后才创建并
+        返回新池，任何失败都不会产生可观察的部分实例或改变已有池。重复
+        导入同一文本返回彼此隔离但内容相同的新对象。重建池保持后端顺序、
+        地址、端口、当前健康标记、权重与容量语义，在其上新建的各调度器
+        与原池的全新调度器得到一致的初始选择结果。单次导入 O(n) 时间与
+        O(n) 额外空间。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        try:
+            configs = json.loads(text)
+        except json.JSONDecodeError:
+            raise ConfigurationError(
+                "pool configuration is not valid JSON"
+            ) from None
+        # 先完成全部字段、类型、范围、未知字段与重复 id 校验并取得
+        # 防御性拷贝，再建立任何实例状态；校验失败时不会产生部分实例，
+        # 解析得到的结构也不会被新池共享。
+        return cls(configs)
 
 
 class RoundRobinScheduler:

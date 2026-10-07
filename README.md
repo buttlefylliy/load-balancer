@@ -18,6 +18,17 @@
 
 仓库初始为空，功能按增量需求持续构建。
 
+## 后端池配置序列化（库接口）
+
+库接口提供纯内存的配置快照入口 `BackendPool.to_json()` 与类级入口 `BackendPool.from_json(text)`，可从 `load_balancer` 直接导入；只处理配置快照，不保存任何调度器游标、连接计数、会话绑定、健康检查计数或事件时间，不新增命令行参数或落盘行为，`schedule` 命令的参数、输出、异常类型与退出码保持不变。
+
+* `to_json()` 返回不带末尾换行的紧凑 JSON 字符串（`separators=(",", ":")`、`ensure_ascii=False`）。顶层为按池声明顺序排列的后端数组；每个后端对象的键固定按 id、address、port、healthy、weight 排列，仅当 `max_connections` 有有限值时才在末尾追加该键。缺省权重统一导出为 1；不限容量（省略 `max_connections`）时不导出该键；非 ASCII 字符直接保留而不是转义。
+* 同一池状态未变化时重复调用逐字节一致；`set_healthy()` 的成功变更立即反映到下一次导出。
+* `from_json(text)` 只接受字符串（`str`）：传入 bytes、bytearray、dict、list 或其他类型抛出 `TypeError`。文本不是合法 JSON、顶层不是数组，或任一后端不满足 `BackendPool` 已有的字段、类型、范围、未知字段及重复 id 规则时，统一抛出 `ConfigurationError`。
+* 解析与全部语义校验完成后才创建并返回新池：任何失败都不会产生可观察的部分实例，也不改变已有池；重复导入同一文本返回彼此隔离但内容相同的新对象。
+* 用 `from_json(to_json())` 重建的池保持后端顺序、地址、端口、当前健康标记、权重与容量语义；在原池与重建池上分别新建的各调度器得到一致的初始选择结果（不迁移任何调度器游标或运行时计数）。
+* 序列化与导入均只使用 Python 标准库，时间与额外工作空间为 O(n)（n 为后端数，输出字符串占用不计入额外空间）。
+
 ## 调度策略
 
 `schedule` 命令支持可选的 `--policy` 参数，省略时为 `round_robin`（输出与既有行为逐字节一致）；`--policy weighted_round_robin` 使用加权轮询。
